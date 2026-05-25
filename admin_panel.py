@@ -6,10 +6,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.filters import Filter
 from pyrogram import Client
+from pyrogram.storage import StringSession
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeExpired, PhoneCodeInvalid
 import database as db
 import userbot_manager as ub_mgr
-from config import ADMIN_IDS, SESSIONS_DIR, UPLOADS_DIR
+from config import ADMIN_IDS, UPLOADS_DIR
 
 admin_router = Router()
 
@@ -65,7 +66,6 @@ def get_back_keyboard() -> ReplyKeyboardMarkup:
 async def go_back(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
 
-    # Если был открыт временный pyrogram-клиент — закрываем его
     if current in (
         MainStates.waiting_for_phone,
         MainStates.waiting_for_code,
@@ -111,12 +111,8 @@ async def show_accounts(message: Message) -> None:
         await message.answer(
             "👥 <b>Аккаунты</b>\n\n"
             "❌ Нет добавленных аккаунтов.\n\n"
-            "Чтобы добавить аккаунт:\n"
-            "1. Запустите бота локально на своём компьютере\n"
-            "2. Настройте API через <b>⚙️ Настройка API</b>\n"
-            "3. Добавьте аккаунт командой /add\n"
-            "4. Запустите скрипт <code>save_sessions.py</code>\n"
-            "5. Добавьте полученные строки в GitHub Secrets",
+            "Нажмите <b>📱 Добавить аккаунт</b>, чтобы войти в Telegram-аккаунт прямо здесь в боте.\n"
+            "Сессия сохранится в базе данных и не потеряется при перезапуске.",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(),
         )
@@ -124,8 +120,9 @@ async def show_accounts(message: Message) -> None:
 
     lines = [f"👥 <b>Аккаунты ({len(accounts)})</b>\n"]
     for acc in accounts:
+        status = "🟢" if acc.get("active", True) else "🔴"
         lines.append(
-            f"✅ <code>{acc['phone']}</code>\n"
+            f"{status} <code>{acc['phone']}</code>\n"
             f"   📤 Отправлено: {acc['sent_count']}\n"
             f"   📅 Добавлен: {str(acc.get('added_at', ''))[:10]}"
         )
@@ -135,6 +132,29 @@ async def show_accounts(message: Message) -> None:
         parse_mode="HTML",
         reply_markup=get_main_keyboard(),
     )
+
+
+# ──────────────────────────────────────────────────────────────
+# ШАГ 1: Номер телефона
+# ──────────────────────────────────────────────────────────────
+
+@admin_router.message(F.text == "📱 Добавить аккаунт")
+async def add_account_start(message: Message, state: FSMContext) -> None:
+    api_id, api_hash = await db.get_api_settings()
+    if not api_id or not api_hash:
+        await message.answer(
+            "⚠️ Сначала настройте API через <b>⚙️ Настройка API</b>.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+    await message.answer(
+        "📱 <b>Добавление аккаунта</b>\n\n"
+        "Введите номер телефона в формате <code>+79001234567</code>:",
+        parse_mode="HTML",
+        reply_markup=get_back_keyboard(),
+    )
+    await state.set_state(MainStates.waiting_for_phone)
 
 
 @admin_router.message(MainStates.waiting_for_phone)
@@ -149,19 +169,33 @@ async def add_acc_phone(message: Message, state: FSMContext) -> None:
         return
 
     api_id, api_hash = await db.get_api_settings()
-    session_name = f"acc_{phone.replace('+', '')}"
-    os.makedirs(SESSIONS_DIR, exist_ok=True)
+    if not api_id or not api_hash:
+        await message.answer(
+            "⚠️ API не настроен. Перейдите в <b>⚙️ Настройка API</b>.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
+        )
+        await state.clear()
+        return
 
     await message.answer("⏳ Отправляю код подтверждения...", reply_markup=get_back_keyboard())
 
-    client = await ub_mgr.create_temp_client(api_id, api_hash, session_name)
+    # Используем StringSession("") — сессия хранится в памяти,
+    # строку экспортируем после входа и сохраняем в БД
+    client = Client(
+        name=f"temp_{phone.replace('+', '')}",
+        api_id=api_id,
+        api_hash=api_hash,
+        session_string="",  # пустая строка = новая StringSession
+        in_memory=True,
+    )
+
     try:
         await client.connect()
         sent = await client.send_code(phone)
         ub_mgr._clients[f"__temp_{phone}"] = client
         await state.update_data(
             phone=phone,
-            session_name=session_name,
             api_id=api_id,
             api_hash=api_hash,
             phone_code_hash=sent.phone_code_hash,
@@ -174,7 +208,10 @@ async def add_acc_phone(message: Message, state: FSMContext) -> None:
         )
         await state.set_state(MainStates.waiting_for_code)
     except Exception as e:
-        await client.disconnect()
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
         await message.answer(
             f"❌ Ошибка при отправке кода: <code>{e}</code>",
             parse_mode="HTML",
@@ -183,16 +220,18 @@ async def add_acc_phone(message: Message, state: FSMContext) -> None:
         await state.clear()
 
 
+# ──────────────────────────────────────────────────────────────
+# ШАГ 2: Код подтверждения
+# ──────────────────────────────────────────────────────────────
+
 @admin_router.message(MainStates.waiting_for_code)
 async def add_acc_code(message: Message, state: FSMContext) -> None:
-    # Убираем пробелы — Telegram показывает код как "1 2 3 4 5"
     code = "".join((message.text or "").split())
     data = await state.get_data()
     phone: str = data["phone"]
     phone_code_hash: str = data["phone_code_hash"]
     api_id: int = data["api_id"]
     api_hash: str = data["api_hash"]
-    session_name: str = data["session_name"]
 
     if not code.isdigit():
         await message.answer(
@@ -209,41 +248,32 @@ async def add_acc_code(message: Message, state: FSMContext) -> None:
 
     try:
         await client.sign_in(phone, phone_code_hash, code)
-        await db.add_account(phone, session_name, api_id, api_hash)
-        ub_mgr._clients[phone] = client
-        ub_mgr._clients.pop(f"__temp_{phone}", None)
-        await message.answer(
-            f"✅ Аккаунт <code>{phone}</code> успешно добавлен!",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(),
-        )
-        await state.clear()
+        await _finalize_account(message, state, client, phone, api_id, api_hash)
+
     except SessionPasswordNeeded:
         await message.answer(
             "🔐 На аккаунте включена двухфакторная аутентификация.\n\nВведите пароль 2FA:",
             reply_markup=get_back_keyboard(),
         )
         await state.set_state(MainStates.waiting_for_2fa)
+
     except PhoneCodeExpired:
-        ub_mgr._clients.pop(f"__temp_{phone}", None)
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        await _cleanup_temp_client(phone)
         await message.answer(
-            "⏰ Код действительно истёк (Telegram даёт ~2 минуты).\n\n"
+            "⏰ Код истёк (Telegram даёт ~2 минуты).\n\n"
             "Нажмите <b>📱 Добавить аккаунт</b> и запросите новый код.",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(),
         )
         await state.clear()
+
     except PhoneCodeInvalid:
         await message.answer(
             "❌ Неверный код. Проверьте цифры и введите ещё раз:",
             reply_markup=get_back_keyboard(),
         )
+
     except Exception as e:
-        # Показываем точную ошибку — помогает диагностировать
         err = str(e)
         if "SESSION_PASSWORD_NEEDED" in err:
             await message.answer(
@@ -252,7 +282,7 @@ async def add_acc_code(message: Message, state: FSMContext) -> None:
             )
             await state.set_state(MainStates.waiting_for_2fa)
         elif "PHONE_CODE_EXPIRED" in err:
-            ub_mgr._clients.pop(f"__temp_{phone}", None)
+            await _cleanup_temp_client(phone)
             await message.answer(
                 "⏰ Код истёк. Нажмите <b>📱 Добавить аккаунт</b> и попробуйте снова.",
                 parse_mode="HTML",
@@ -265,6 +295,7 @@ async def add_acc_code(message: Message, state: FSMContext) -> None:
                 reply_markup=get_back_keyboard(),
             )
         else:
+            await _cleanup_temp_client(phone)
             await message.answer(
                 f"❌ Ошибка при входе:\n<code>{e}</code>\n\nПопробуйте заново.",
                 parse_mode="HTML",
@@ -273,6 +304,10 @@ async def add_acc_code(message: Message, state: FSMContext) -> None:
             await state.clear()
 
 
+# ──────────────────────────────────────────────────────────────
+# ШАГ 3 (опционально): Пароль 2FA
+# ──────────────────────────────────────────────────────────────
+
 @admin_router.message(MainStates.waiting_for_2fa)
 async def add_acc_2fa(message: Message, state: FSMContext) -> None:
     password = message.text.strip() if message.text else ""
@@ -280,7 +315,6 @@ async def add_acc_2fa(message: Message, state: FSMContext) -> None:
     phone: str = data["phone"]
     api_id: int = data["api_id"]
     api_hash: str = data["api_hash"]
-    session_name: str = data["session_name"]
 
     client: Client | None = ub_mgr._clients.get(f"__temp_{phone}")
     if not client:
@@ -290,21 +324,64 @@ async def add_acc_2fa(message: Message, state: FSMContext) -> None:
 
     try:
         await client.check_password(password)
-        await db.add_account(phone, session_name, api_id, api_hash)
-        ub_mgr._clients[phone] = client
-        ub_mgr._clients.pop(f"__temp_{phone}", None)
-        await message.answer(
-            f"✅ Аккаунт <code>{phone}</code> добавлен (2FA прошёл успешно)!",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(),
-        )
-        await state.clear()
+        await _finalize_account(message, state, client, phone, api_id, api_hash)
     except Exception as e:
         await message.answer(
             f"❌ Неверный пароль 2FA: <code>{e}</code>\n\nПопробуйте ещё раз:",
             parse_mode="HTML",
             reply_markup=get_back_keyboard(),
         )
+
+
+# ──────────────────────────────────────────────────────────────
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ──────────────────────────────────────────────────────────────
+
+async def _finalize_account(
+    message: Message,
+    state: FSMContext,
+    client: Client,
+    phone: str,
+    api_id: int,
+    api_hash: str,
+) -> None:
+    """Экспортируем StringSession, сохраняем в БД и регистрируем клиент."""
+    try:
+        session_string = await client.export_session_string()
+    except Exception as e:
+        await _cleanup_temp_client(phone)
+        await message.answer(
+            f"❌ Не удалось экспортировать сессию: <code>{e}</code>",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
+        )
+        await state.clear()
+        return
+
+    # Сохраняем строку сессии в базу данных — она не потеряется при перезапуске
+    await db.add_account(phone, session_string, api_id, api_hash)
+
+    # Переносим клиент из временного хранилища в постоянное
+    ub_mgr._clients[phone] = client
+    ub_mgr._clients.pop(f"__temp_{phone}", None)
+
+    await message.answer(
+        f"✅ Аккаунт <code>{phone}</code> успешно добавлен!\n\n"
+        f"Сессия сохранена в базу данных — аккаунт останется активным после перезапуска.",
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(),
+    )
+    await state.clear()
+
+
+async def _cleanup_temp_client(phone: str) -> None:
+    """Закрываем и удаляем временный клиент."""
+    client = ub_mgr._clients.pop(f"__temp_{phone}", None)
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 
 
 # ──────────────────────────────────────────────────────────────
@@ -506,7 +583,7 @@ async def get_api_hash(message: Message, state: FSMContext) -> None:
         f"✅ <b>API успешно настроен!</b>\n\n"
         f"API_ID: <code>{api_id}</code>\n"
         f"API_HASH: <code>{api_hash}</code>\n\n"
-        f"Теперь можно добавлять аккаунты.",
+        f"Теперь можно добавлять аккаунты через <b>📱 Добавить аккаунт</b>.",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(),
     )
@@ -563,7 +640,6 @@ async def check_base_file(message: Message, state: FSMContext) -> None:
     with open(file_path, "r", encoding="utf-8") as f:
         raw_lines = [line.strip() for line in f if line.strip()]
 
-    # Нормализуем номера — добавляем + если нет
     numbers = []
     for n in raw_lines:
         if n.lstrip("+").isdigit():
@@ -601,7 +677,6 @@ async def check_base_file(message: Message, state: FSMContext) -> None:
     if "error" in result:
         await status_msg.edit_text(
             f"❌ Ошибка: {result['error']}",
-            reply_markup=get_main_keyboard(),
         )
         return
 
