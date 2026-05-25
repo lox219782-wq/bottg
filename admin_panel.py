@@ -162,13 +162,21 @@ async def add_acc_phone(message: Message, state: FSMContext) -> None:
 
 @admin_router.message(MainStates.waiting_for_code)
 async def add_acc_code(message: Message, state: FSMContext) -> None:
-    code = message.text.strip() if message.text else ""
+    # Убираем пробелы — Telegram показывает код как "1 2 3 4 5"
+    code = "".join((message.text or "").split())
     data = await state.get_data()
     phone: str = data["phone"]
     phone_code_hash: str = data["phone_code_hash"]
     api_id: int = data["api_id"]
     api_hash: str = data["api_hash"]
     session_name: str = data["session_name"]
+
+    if not code.isdigit():
+        await message.answer(
+            "❌ Код должен содержать только цифры. Введите ещё раз:",
+            reply_markup=get_back_keyboard(),
+        )
+        return
 
     client: Client | None = ub_mgr._clients.get(f"__temp_{phone}")
     if not client:
@@ -200,23 +208,46 @@ async def add_acc_code(message: Message, state: FSMContext) -> None:
         except Exception:
             pass
         await message.answer(
-            "❌ Код истёк. Нажмите <b>📱 Добавить аккаунт</b> и попробуйте снова.",
+            "⏰ Код действительно истёк (Telegram даёт ~2 минуты).\n\n"
+            "Нажмите <b>📱 Добавить аккаунт</b> и запросите новый код.",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(),
         )
         await state.clear()
     except PhoneCodeInvalid:
         await message.answer(
-            "❌ Неверный код. Проверьте и введите ещё раз:",
+            "❌ Неверный код. Проверьте цифры и введите ещё раз:",
             reply_markup=get_back_keyboard(),
         )
     except Exception as e:
-        await message.answer(
-            f"❌ Ошибка: <code>{e}</code>",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(),
-        )
-        await state.clear()
+        # Показываем точную ошибку — помогает диагностировать
+        err = str(e)
+        if "SESSION_PASSWORD_NEEDED" in err:
+            await message.answer(
+                "🔐 Требуется пароль 2FA. Введите пароль:",
+                reply_markup=get_back_keyboard(),
+            )
+            await state.set_state(MainStates.waiting_for_2fa)
+        elif "PHONE_CODE_EXPIRED" in err:
+            ub_mgr._clients.pop(f"__temp_{phone}", None)
+            await message.answer(
+                "⏰ Код истёк. Нажмите <b>📱 Добавить аккаунт</b> и попробуйте снова.",
+                parse_mode="HTML",
+                reply_markup=get_main_keyboard(),
+            )
+            await state.clear()
+        elif "PHONE_CODE_INVALID" in err:
+            await message.answer(
+                "❌ Неверный код. Проверьте цифры и введите ещё раз:",
+                reply_markup=get_back_keyboard(),
+            )
+        else:
+            await message.answer(
+                f"❌ Ошибка при входе:\n<code>{e}</code>\n\nПопробуйте заново.",
+                parse_mode="HTML",
+                reply_markup=get_main_keyboard(),
+            )
+            await state.clear()
 
 
 @admin_router.message(MainStates.waiting_for_2fa)
