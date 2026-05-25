@@ -1,6 +1,6 @@
+import random
 import asyncio
 import logging
-import random
 from pyrogram import Client, raw
 from pyrogram.errors import (
     FloodWait,
@@ -94,21 +94,20 @@ async def send_to_phone(
             # client_id ОБЯЗАН быть уникальным случайным числом —
             # при client_id=0 Telegram дедуплицирует запрос и возвращает пустой users.
             contact_id = random.randint(1, 2**31 - 1)
-            logger.debug("Импортируем контакт %s (client_id=%d)", recipient_phone, contact_id)
-            result = await asyncio.wait_for(
-                client.invoke(
-                    raw.functions.contacts.ImportContacts(
-                        contacts=[
-                            raw.types.InputPhoneContact(
-                                client_id=contact_id,
-                                phone=recipient_phone,
-                                first_name="Contact",
-                                last_name="",
-                            )
-                        ]
-                    )
-                ),
-                timeout=30,
+result = await asyncio.wait_for(
+    client.invoke(
+        raw.functions.contacts.ImportContacts(
+            contacts=[
+                raw.types.InputPhoneContact(
+                    client_id=contact_id,   # уникальный ID
+                    phone=recipient_phone,
+                    first_name="Contact",
+                    last_name="",
+                )
+            ]
+        )
+    ),
+    timeout=30,   # таймаут — не зависнет навсегда
             )
 
             if not result.users:
@@ -129,10 +128,11 @@ async def send_to_phone(
             return "ok"
 
         except FloodWait as e:
-            wait = e.value + 3
-            logger.warning("FloodWait %d сек для %s (попытка %d/%d)", wait, sender_phone, attempt + 1, _max_retries)
-            if attempt < _max_retries - 1:
-                await asyncio.sleep(wait)
+    wait = e.value + 3
+    if attempt < _max_retries - 1:
+        await asyncio.sleep(wait)
+        continue
+    return f"error: flood_wait {e.value}s"
                 continue
             # Исчерпали попытки
             await db.log_mailing(sender_phone, recipient_phone, f"flood_wait:{e.value}")
