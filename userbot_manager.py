@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 from pyrogram import Client, raw
 from pyrogram.errors import (
     FloodWait,
@@ -75,79 +76,94 @@ async def send_to_phone(
     sender_phone: str,
     recipient_phone: str,
     text: str,
+    *,
+    _max_retries: int = 3,
 ) -> str:
     """
     Добавляет номер как контакт → отправляет сообщение → удаляет из контактов.
     Возвращает: 'ok', 'no_telegram', 'privacy', 'banned', 'error: ...'
     """
     user_id = None
-    try:
-        # Шаг 1: добавляем номер в контакты
-        result = await client.invoke(
-            raw.functions.contacts.ImportContacts(
-                contacts=[
-                    raw.types.InputPhoneContact(
-                        client_id=0,
-                        phone=recipient_phone,
-                        first_name="Contact",
-                        last_name="",
-                    )
-                ]
-            )
-        )
+    user = None
 
-        if not result.users:
-            # Номер не в Telegram
-            return "no_telegram"
-
-        user = result.users[0]
-        user_id = user.id
-
-        # Шаг 2: отправляем сообщение
-        await client.send_message(user_id, text)
-        await db.log_mailing(sender_phone, recipient_phone, "ok")
-        await db.increment_sent(sender_phone)
-        return "ok"
-
-    except FloodWait as e:
-        wait = e.value + 3
-        logger.warning("FloodWait %d сек для %s", wait, sender_phone)
-        await asyncio.sleep(wait)
-        # Повторная попытка после ожидания
-        return await send_to_phone(client, sender_phone, recipient_phone, text)
-
-    except UserPrivacyRestricted:
-        await db.log_mailing(sender_phone, recipient_phone, "privacy")
-        return "privacy"
-
-    except (PeerIdInvalid, ValueError):
-        await db.log_mailing(sender_phone, recipient_phone, "invalid")
-        return "invalid"
-
-    except (UserDeactivated, AuthKeyUnregistered, PhoneNumberBanned):
-        await db.deactivate_account(sender_phone)
-        await db.log_mailing(sender_phone, recipient_phone, "account_banned")
-        return "banned"
-
-    except Exception as e:
-        err = str(e)
-        await db.log_mailing(sender_phone, recipient_phone, f"error: {err}")
-        return f"error: {err}"
-
-    finally:
-        # Шаг 3: удаляем из контактов в любом случае
-        if user_id:
-            try:
-                await client.invoke(
-                    raw.functions.contacts.DeleteContacts(
-                        id=[raw.types.InputUser(
-                            user_id=user_id,
-                            access_hash=user.access_hash,
-                        )]
-                    )
+    for attempt in range(_max_retries):
+        user_id = None
+        user = None
+        try:
+            # Шаг 1: добавляем номер в контакты.
+            # client_id ОБЯЗАН быть уникальным случайным числом —
+            # при client_id=0 Telegram дедуплицирует запрос и возвращает пустой users.
+            contact_id = random.randint(1, 2**31 - 1)
+            result = await client.invoke(
+                raw.functions.contacts.ImportContacts(
+                    contacts=[
+                        raw.types.InputPhoneContact(
+                            client_id=contact_id,
+                            phone=recipient_phone,
+                            first_name="Contact",
+                            last_name="",
+                        )
+                    ]
                 )
-            except Exception:
-                pass
+            )
+
+            if not result.users:
+                return "no_telegram"
+
+            user = result.users[0]
+            user_id = user.id
+
+            # Шаг 2: отправляем сообщение
+            await client.send_message(user_id, text)
+            await db.log_mailing(sender_phone, recipient_phone, "ok")
+            await db.increment_sent(sender_phone)
+            return "ok"
+
+        except FloodWait as e:
+            wait = e.value + 3
+            logger.warning("FloodWait %d сек для %s (попытка %d/%d)", wait, sender_phone, attempt + 1, _max_retries)
+            if attempt < _max_retries - 1:
+                await asyncio.sleep(wait)
+                continue
+            # Исчерпали попытки
+            await db.log_mailing(sender_phone, recipient_phone, f"flood_wait:{e.value}")
+            return f"error: flood_wait {e.value}s"
+
+        except UserPrivacyRestricted:
+            await db.log_mailing(sender_phone, recipient_phone, "privacy")
+            return "privacy"
+
+        except (PeerIdInvalid, ValueError):
+            await db.log_mailing(sender_phone, recipient_phone, "invalid")
+            return "invalid"
+
+        except (UserDeactivated, AuthKeyUnregistered, PhoneNumberBanned):
+            await db.deactivate_account(sender_phone)
+            await db.log_mailing(sender_phone, recipient_phone, "account_banned")
+            return "banned"
+
+        except Exception as e:
+            err = str(e)
+            logger.warning("Ошибка отправки на %s: %s", recipient_phone, err)
+            await db.log_mailing(sender_phone, recipient_phone, f"error: {err}")
+            return f"error: {err}"
+
+        finally:
+            # Шаг 3: удаляем из контактов в любом случае
+            if user_id is not None and user is not None:
+                try:
+                    await client.invoke(
+                        raw.functions.contacts.DeleteContacts(
+                            id=[raw.types.InputUser(
+                                user_id=user_id,
+                                access_hash=user.access_hash,
+                            )]
+                        )
+                    )
+                except Exception:
+                    pass
+
+    return "error: max retries exceeded"
 
 
 async def disconnect_all() -> None:
