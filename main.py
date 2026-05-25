@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 async def on_startup(bot: Bot) -> None:
-    await db.init_db()
+    db.init_db()  # Убран await
     logger.info("База данных инициализирована")
 
     for admin_id in ADMIN_IDS:
