@@ -405,9 +405,10 @@ async def show_stats(message: Message) -> None:
     accounts = await db.get_all_accounts()
 
     lines = [
-        "📊 <b>Статистика рассылки</b>\n",
+        "📊 <b>Статистика</b>\n",
         f"🟢 Активных аккаунтов: <b>{stats['active']}</b>",
         f"🔴 Отключённых аккаунтов: <b>{stats['inactive']}</b>",
+        f"👥 Контактов в базе (с Telegram): <b>{stats['contacts']}</b>",
         f"📤 Всего отправлено сообщений: <b>{stats['total_sent']}</b>",
         f"📅 Отправлено сегодня: <b>{stats['sent_today']}</b>",
     ]
@@ -489,16 +490,32 @@ async def get_api_hash(message: Message, state: FSMContext) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# 5. ПРОВЕРИТЬ БАЗУ
+# 5. ПРОВЕРИТЬ БАЗУ (проверка номеров на наличие Telegram)
 # ──────────────────────────────────────────────────────────────
 
 @admin_router.message(F.text == "🔍 Проверить базу")
 async def check_base_start(message: Message, state: FSMContext) -> None:
+    accounts = await db.get_all_accounts()
+    if not accounts:
+        await message.answer(
+            "⚠️ Нет активных аккаунтов для проверки.\n"
+            "Сначала добавьте аккаунт через <b>📱 Добавить аккаунт</b>.",
+            parse_mode="HTML",
+        )
+        return
+
+    contacts_count = await db.get_contacts_count()
+    hint = ""
+    if contacts_count:
+        hint = f"\n\n📋 Уже в базе: <b>{contacts_count}</b> контактов с Telegram"
+
     await message.answer(
         "🔍 <b>Проверка базы номеров</b>\n\n"
         "Отправьте <b>.txt файл</b> со списком номеров телефонов\n"
-        "(один номер на строку).\n\n"
-        "Бот покажет, какие из них уже есть в активных аккаунтах:",
+        "(один номер на строку, формат: +79001234567).\n\n"
+        "Бот проверит каждый номер — есть ли у него Telegram,\n"
+        "и сохранит найденных в базу для рассылки."
+        f"{hint}",
         parse_mode="HTML",
         reply_markup=get_back_keyboard(),
     )
@@ -521,38 +538,78 @@ async def check_base_file(message: Message, state: FSMContext) -> None:
     await message.bot.download(doc, destination=file_path)
 
     with open(file_path, "r", encoding="utf-8") as f:
-        numbers = [line.strip() for line in f if line.strip()]
+        raw_lines = [line.strip() for line in f if line.strip()]
+
+    # Нормализуем номера — добавляем + если нет
+    numbers = []
+    for n in raw_lines:
+        if n.lstrip("+").isdigit():
+            numbers.append(n if n.startswith("+") else f"+{n}")
 
     await state.clear()
 
     if not numbers:
-        await message.answer("❌ Файл пустой.", reply_markup=get_main_keyboard())
+        await message.answer(
+            "❌ Файл пустой или не содержит телефонных номеров.",
+            reply_markup=get_main_keyboard(),
+        )
         return
 
-    accounts = await db.get_all_accounts()
-    active_phones = {a["phone"] for a in accounts}
-
-    found = [n for n in numbers if n in active_phones]
-    not_found = [n for n in numbers if n not in active_phones]
-
-    lines = [
-        "🔍 <b>Результат проверки базы</b>\n",
-        f"📋 Всего номеров в файле: <b>{len(numbers)}</b>",
-        f"✅ Совпадений с активными аккаунтами: <b>{len(found)}</b>",
-        f"❌ Не найдено: <b>{len(not_found)}</b>",
-    ]
-
-    if found:
-        lines.append("\n<b>Найденные номера:</b>")
-        for n in found[:20]:
-            lines.append(f"  ✅ <code>{n}</code>")
-        if len(found) > 20:
-            lines.append(f"  <i>... и ещё {len(found) - 20}</i>")
-
-    await message.answer(
-        "\n".join(lines),
+    status_msg = await message.answer(
+        f"🔍 Начинаю проверку <b>{len(numbers)}</b> номеров...\n"
+        f"⏳ Это займёт некоторое время.",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(),
+    )
+
+    async def progress(done: int, total: int, found_count: int) -> None:
+        try:
+            await status_msg.edit_text(
+                f"🔍 <b>Проверка в процессе...</b>\n\n"
+                f"Обработано: {done}/{total}\n"
+                f"✅ Найдено с Telegram: {found_count}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    result = await ub_mgr.check_contacts(numbers, progress_callback=progress)
+
+    if "error" in result:
+        await status_msg.edit_text(
+            f"❌ Ошибка: {result['error']}",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    found = result["found"]
+    new_count = 0
+    if found:
+        new_count = await db.save_contacts(found)
+
+    total_in_db = await db.get_contacts_count()
+
+    lines = [
+        "✅ <b>Проверка завершена!</b>\n",
+        f"📋 Всего номеров в файле: <b>{len(numbers)}</b>",
+        f"✅ Есть Telegram: <b>{len(found)}</b>",
+        f"❌ Нет Telegram: <b>{result['not_found']}</b>",
+        f"🆕 Новых добавлено в базу: <b>{new_count}</b>",
+        f"📊 Всего в базе контактов: <b>{total_in_db}</b>",
+    ]
+
+    if found[:5]:
+        lines.append("\n<b>Примеры найденных:</b>")
+        for c in found[:5]:
+            name = c.get("first_name") or ""
+            username = f" @{c['username']}" if c.get("username") else ""
+            lines.append(f"  ✅ <code>{c['phone']}</code> {name}{username}")
+        if len(found) > 5:
+            lines.append(f"  <i>... и ещё {len(found) - 5}</i>")
+
+    await status_msg.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
     )
 
 
