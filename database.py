@@ -12,7 +12,7 @@ async def init_db() -> None:
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 phone TEXT UNIQUE NOT NULL,
-                session_name TEXT NOT NULL,
+                session_string TEXT NOT NULL DEFAULT '',
                 api_id INTEGER NOT NULL,
                 api_hash TEXT NOT NULL,
                 active INTEGER DEFAULT 1,
@@ -20,6 +20,19 @@ async def init_db() -> None:
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Миграция: добавляем session_string если таблица уже существует со старой схемой
+        try:
+            await db.execute("ALTER TABLE accounts ADD COLUMN session_string TEXT NOT NULL DEFAULT ''")
+            await db.commit()
+        except Exception:
+            pass
+        # Миграция: убираем зависимость от session_name (оставляем для совместимости)
+        try:
+            await db.execute("ALTER TABLE accounts ADD COLUMN session_name TEXT NOT NULL DEFAULT ''")
+            await db.commit()
+        except Exception:
+            pass
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS api_settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -78,12 +91,13 @@ async def get_api_settings() -> tuple[int, str]:
     return (_default_api_id, _default_api_hash)
 
 
-async def add_account(phone: str, session_name: str, api_id: int, api_hash: str) -> None:
+async def add_account(phone: str, session_string: str, api_id: int, api_hash: str) -> None:
+    """Сохраняет аккаунт с session_string (строка Pyrogram StringSession)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
-            INSERT OR REPLACE INTO accounts (phone, session_name, api_id, api_hash, active, sent_count)
+            INSERT OR REPLACE INTO accounts (phone, session_string, api_id, api_hash, active, sent_count)
             VALUES (?, ?, ?, ?, 1, 0)
-        """, (phone, session_name, api_id, api_hash))
+        """, (phone, session_string, api_id, api_hash))
         await db.commit()
 
 
