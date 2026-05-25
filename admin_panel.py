@@ -42,9 +42,9 @@ class MainStates(StatesGroup):
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📱 Добавить аккаунт (UserBot)")],
-            [KeyboardButton(text="🚀 Запустить рекламу"), KeyboardButton(text="📊 Статистика")],
-            [KeyboardButton(text="⚙️ Настройка API"), KeyboardButton(text="🔍 Проверить базу")],
+            [KeyboardButton(text="👥 Аккаунты"), KeyboardButton(text="📊 Статистика")],
+            [KeyboardButton(text="🚀 Запустить рекламу"), KeyboardButton(text="🔍 Проверить базу")],
+            [KeyboardButton(text="⚙️ Настройка API")],
         ],
         resize_keyboard=True,
     )
@@ -100,18 +100,41 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# 1. ДОБАВИТЬ АККАУНТ
+# 1. АККАУНТЫ
 # ──────────────────────────────────────────────────────────────
 
-@admin_router.message(F.text == "📱 Добавить аккаунт (UserBot)")
-async def add_acc_start(message: Message, state: FSMContext) -> None:
+@admin_router.message(F.text == "👥 Аккаунты")
+async def show_accounts(message: Message) -> None:
+    accounts = await db.get_all_accounts()
+
+    if not accounts:
+        await message.answer(
+            "👥 <b>Аккаунты</b>\n\n"
+            "❌ Нет добавленных аккаунтов.\n\n"
+            "Чтобы добавить аккаунт:\n"
+            "1. Запустите бота локально на своём компьютере\n"
+            "2. Настройте API через <b>⚙️ Настройка API</b>\n"
+            "3. Добавьте аккаунт командой /add\n"
+            "4. Запустите скрипт <code>save_sessions.py</code>\n"
+            "5. Добавьте полученные строки в GitHub Secrets",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    lines = [f"👥 <b>Аккаунты ({len(accounts)})</b>\n"]
+    for acc in accounts:
+        lines.append(
+            f"✅ <code>{acc['phone']}</code>\n"
+            f"   📤 Отправлено: {acc['sent_count']}\n"
+            f"   📅 Добавлен: {str(acc.get('added_at', ''))[:10]}"
+        )
+
     await message.answer(
-        "📱 <b>Добавление аккаунта</b>\n\n"
-        "Введите номер телефона в формате <code>+79001234567</code>:",
+        "\n\n".join(lines),
         parse_mode="HTML",
-        reply_markup=get_back_keyboard(),
+        reply_markup=get_main_keyboard(),
     )
-    await state.set_state(MainStates.waiting_for_phone)
 
 
 @admin_router.message(MainStates.waiting_for_phone)
