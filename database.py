@@ -1,41 +1,122 @@
-import sqlite3
+import os
+import aiosqlite
+from config import DB_PATH
 
-DB_PATH = "bot_system.db"
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS userbots (phone TEXT PRIMARY KEY, session_string TEXT NOT NULL)")
-    cursor.execute("""CREATE TABLE IF NOT EXISTS tasks (
-        phone TEXT PRIMARY KEY, 
-        text TEXT, 
-        interval INTEGER, 
-        status TEXT DEFAULT 'idle'
-    )""")
-    cursor.execute("CREATE TABLE IF NOT EXISTS api_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    cursor.execute("INSERT OR IGNORE INTO api_settings VALUES ('api_id', '2040'), ('api_hash', 'b18441a1ff607e10a989891a5462e627')")
-    conn.commit()
-    conn.close()
+async def init_db() -> None:
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT UNIQUE NOT NULL,
+                session_name TEXT NOT NULL,
+                api_id INTEGER NOT NULL,
+                api_hash TEXT NOT NULL,
+                active INTEGER DEFAULT 1,
+                sent_count INTEGER DEFAULT 0,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS api_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                api_id INTEGER NOT NULL,
+                api_hash TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS mailing_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL,
+                recipient TEXT NOT NULL,
+                status TEXT NOT NULL,
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.commit()
 
-def get_api_credentials():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT key, value FROM api_settings")
-    data = dict(cursor.fetchall())
-    conn.close()
-    return data.get('api_id', '2040'), data.get('api_hash', 'b18441a1ff607e10a989891a5462e627')
 
-def add_userbot(phone, session_string):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO userbots (phone, session_string) VALUES (?, ?)", (phone, session_string))
-    conn.commit()
-    conn.close()
+async def save_api_settings(api_id: int, api_hash: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO api_settings (id, api_id, api_hash)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET api_id=excluded.api_id,
+                                           api_hash=excluded.api_hash,
+                                           updated_at=CURRENT_TIMESTAMP
+        """, (api_id, api_hash))
+        await db.commit()
 
-def get_all_userbots():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT phone, session_string FROM userbots")
-    rows = cursor.fetchall()
-    conn.close()
-    return rows
+
+async def get_api_settings() -> tuple[int, str] | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT api_id, api_hash FROM api_settings WHERE id=1") as cursor:
+            row = await cursor.fetchone()
+            return (row[0], row[1]) if row else None
+
+
+async def add_account(phone: str, session_name: str, api_id: int, api_hash: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT OR REPLACE INTO accounts (phone, session_name, api_id, api_hash, active, sent_count)
+            VALUES (?, ?, ?, ?, 1, 0)
+        """, (phone, session_name, api_id, api_hash))
+        await db.commit()
+
+
+async def get_all_accounts() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM accounts WHERE active=1") as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def increment_sent(phone: str, count: int = 1) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE accounts SET sent_count = sent_count + ? WHERE phone=?",
+            (count, phone)
+        )
+        await db.commit()
+
+
+async def log_mailing(phone: str, recipient: str, status: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO mailing_log (phone, recipient, status) VALUES (?, ?, ?)",
+            (phone, recipient, status)
+        )
+        await db.commit()
+
+
+async def get_stats() -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*), SUM(sent_count) FROM accounts WHERE active=1") as c:
+            row = await c.fetchone()
+            active = row[0] or 0
+            total_sent = row[1] or 0
+        async with db.execute("SELECT COUNT(*) FROM accounts WHERE active=0") as c:
+            row = await c.fetchone()
+            inactive = row[0] or 0
+        async with db.execute(
+            "SELECT COUNT(*) FROM mailing_log WHERE status='ok' AND date(sent_at)=date('now')"
+        ) as c:
+            row = await c.fetchone()
+            sent_today = row[0] or 0
+    return {
+        "active": active,
+        "inactive": inactive,
+        "total_sent": total_sent,
+        "sent_today": sent_today,
+    }
+
+
+async def deactivate_account(phone: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE accounts SET active=0 WHERE phone=?", (phone,))
+        await db.commit()
