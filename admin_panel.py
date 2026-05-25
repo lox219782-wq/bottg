@@ -351,10 +351,10 @@ async def mailing_got_file(message: Message, state: FSMContext) -> None:
     await message.bot.download(doc, destination=file_path)
 
     with open(file_path, "r", encoding="utf-8") as f:
-        raw = [line.strip() for line in f if line.strip()]
+        lines_raw = [line.strip() for line in f if line.strip()]
 
     numbers = []
-    for n in raw:
+    for n in lines_raw:
         clean = n.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
         if clean.lstrip("+").isdigit() and len(clean) >= 10:
             numbers.append(clean if clean.startswith("+") else f"+{clean}")
@@ -414,4 +414,235 @@ async def mailing_got_interval(message: Message, state: FSMContext) -> None:
     n_acc = len(active_accounts)
 
     status_msg = await message.answer(
-        f
+        f"🚀 <b>Рассылка запущена!</b>\n\n"
+        f"📋 Номеров: <b>{len(numbers)}</b>\n"
+        f"⏱ Интервал: <b>{interval} сек</b> на аккаунт\n"
+        f"👤 Аккаунтов: <b>{n_acc}</b> (параллельно)\n\n"
+        f"Прогресс: 0/{len(numbers)}",
+        parse_mode="HTML", reply_markup=get_stop_keyboard(),
+    )
+
+    _mailing_task = asyncio.create_task(
+        _run_mailing(
+            bot=message.bot,
+            chat_id=message.chat.id,
+            status_msg=status_msg,
+            numbers=numbers,
+            text=mailing_text,
+            interval=interval,
+            accounts=active_accounts,
+        )
+    )
+
+
+async def _run_mailing(
+    bot, chat_id: int, status_msg,
+    numbers: list[str], text: str, interval: int, accounts: list[dict],
+) -> None:
+    total = len(numbers)
+    n_acc = len(accounts)
+
+    counters = {"ok": 0, "no_tg": 0, "privacy": 0, "banned": 0, "error": 0, "done": 0}
+    per_acc = {acc["phone"]: {"ok": 0, "no_tg": 0, "fail": 0} for acc in accounts}
+    lock = asyncio.Lock()
+
+    async def update_status() -> None:
+        try:
+            lines = [
+                f"⏳ <b>Рассылка в процессе...</b>\n",
+                f"Прогресс: {counters['done']}/{total}",
+                f"✅ Отправлено: {counters['ok']}",
+                f"⭕ Нет Telegram: {counters['no_tg']}",
+                f"🔒 Приватность: {counters['privacy']}",
+                f"❌ Ошибок: {counters['error']}",
+            ]
+            if n_acc > 1:
+                lines.append("\n<b>По аккаунтам:</b>")
+                for phone, s in per_acc.items():
+                    lines.append(f"  <code>{phone[-7:]}</code>: ✅{s['ok']} ⭕{s['no_tg']} ❌{s['fail']}")
+            await status_msg.edit_text("\n".join(lines), parse_mode="HTML")
+        except Exception:
+            pass
+
+    async def worker(account: dict, my_numbers: list[str]) -> None:
+        phone = account["phone"]
+        try:
+            client = await ub_mgr.get_client(phone, account["api_id"], account["api_hash"])
+        except Exception as e:
+            logger.warning("Не удалось получить клиент %s: %s", phone, e)
+            async with lock:
+                counters["error"] += len(my_numbers)
+                counters["done"] += len(my_numbers)
+            return
+
+        for i, recipient in enumerate(my_numbers):
+            try:
+                status = await ub_mgr.send_to_phone(client, phone, recipient, text)
+            except Exception as e:
+                status = f"error: {e}"
+
+            async with lock:
+                counters["done"] += 1
+                if status == "ok":
+                    counters["ok"] += 1
+                    per_acc[phone]["ok"] += 1
+                elif status == "no_telegram":
+                    counters["no_tg"] += 1
+                    per_acc[phone]["no_tg"] += 1
+                elif status == "privacy":
+                    counters["privacy"] += 1
+                    per_acc[phone]["fail"] += 1
+                elif status == "banned":
+                    counters["banned"] += 1
+                    per_acc[phone]["fail"] += 1
+                else:
+                    counters["error"] += 1
+                    per_acc[phone]["fail"] += 1
+
+                if counters["done"] % 5 == 0 or counters["done"] == total:
+                    asyncio.create_task(update_status())
+
+            # Пауза между сообщениями этого аккаунта (кроме последнего)
+            if i < len(my_numbers) - 1:
+                await asyncio.sleep(interval)
+
+    # Делим номера между аккаунтами по очереди:
+    # 3 аккаунта, 9 номеров → acc0:[0,3,6], acc1:[1,4,7], acc2:[2,5,8]
+    worker_coros = []
+    for idx, account in enumerate(accounts):
+        my_slice = numbers[idx::n_acc]
+        if my_slice:
+            worker_coros.append(worker(account, my_slice))
+
+    result_text = ""
+    try:
+        await asyncio.gather(*worker_coros)
+
+        result_text = (
+            f"✅ <b>Рассылка завершена!</b>\n\n"
+            f"📋 Всего номеров: {total}\n"
+            f"✅ Отправлено: {counters['ok']}\n"
+            f"⭕ Нет Telegram: {counters['no_tg']}\n"
+            f"🔒 Приватность: {counters['privacy']}\n"
+            f"❌ Ошибок: {counters['error']}\n"
+            f"🚫 Забанено аккаунтов: {counters['banned']}\n"
+        )
+        if n_acc > 1:
+            result_text += "\n<b>По аккаунтам:</b>\n"
+            for phone, s in per_acc.items():
+                result_text += f"  <code>{phone}</code>: ✅{s['ok']} ⭕{s['no_tg']} ❌{s['fail']}\n"
+
+    except asyncio.CancelledError:
+        result_text = (
+            f"🛑 <b>Рассылка остановлена</b>\n\n"
+            f"Обработано: {counters['done']}/{total}\n"
+            f"✅ Отправлено: {counters['ok']} | "
+            f"⭕ Нет Telegram: {counters['no_tg']} | "
+            f"❌ Ошибок: {counters['error']}"
+        )
+
+    try:
+        await status_msg.edit_text(result_text, parse_mode="HTML")
+    except Exception:
+        pass
+
+    try:
+        await bot.send_message(chat_id, "🏠 Главное меню", reply_markup=get_main_keyboard())
+    except Exception:
+        pass
+
+
+# ──────────────────────────────────────────────────────────────
+# СТОП
+# ──────────────────────────────────────────────────────────────
+
+@admin_router.message(F.text == STOP_BTN)
+async def mailing_stop(message: Message) -> None:
+    global _mailing_task
+    if _mailing_task and not _mailing_task.done():
+        _mailing_task.cancel()
+        await message.answer("🛑 Останавливаю рассылку...", reply_markup=get_main_keyboard())
+    else:
+        await message.answer("ℹ️ Рассылка не запущена.", reply_markup=get_main_keyboard())
+
+
+# ──────────────────────────────────────────────────────────────
+# 4. СТАТИСТИКА
+# ──────────────────────────────────────────────────────────────
+
+@admin_router.message(F.text == "📊 Статистика")
+async def show_stats(message: Message) -> None:
+    stats = await db.get_stats()
+    accounts = await db.get_all_accounts()
+    lines = [
+        "📊 <b>Статистика</b>\n",
+        f"🟢 Активных аккаунтов: <b>{stats['active']}</b>",
+        f"🔴 Отключённых: <b>{stats['inactive']}</b>",
+        f"📤 Всего отправлено: <b>{stats['total_sent']}</b>",
+        f"📅 Отправлено сегодня: <b>{stats['sent_today']}</b>",
+    ]
+    global _mailing_task
+    if _mailing_task and not _mailing_task.done():
+        lines.append("\n🔄 <b>Рассылка сейчас активна</b>")
+    if accounts:
+        lines.append("\n<b>Аккаунты:</b>")
+        for acc in accounts:
+            s = "🟢" if acc.get("active", 1) else "🔴"
+            lines.append(f"  {s} <code>{acc['phone']}</code> — отправлено: {acc['sent_count']}")
+    else:
+        lines.append("\n<i>Аккаунты не добавлены</i>")
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=get_main_keyboard())
+
+
+# ──────────────────────────────────────────────────────────────
+# 5. НАСТРОЙКА API
+# ──────────────────────────────────────────────────────────────
+
+@admin_router.message(F.text == "⚙️ Настройка API")
+async def api_settings_start(message: Message, state: FSMContext) -> None:
+    current = await db.get_api_settings()
+    status = (
+        f"\n\n<i>Текущий API_ID: <code>{current[0]}</code></i>" if current[0]
+        else "\n\n<i>API ещё не настроен</i>"
+    )
+    await message.answer(
+        f"⚙️ <b>Настройка API Telegram</b>{status}\n\n"
+        f"Шаг 1/2: Введите <b>API_ID</b>\n"
+        f"Получить: my.telegram.org → App configuration",
+        parse_mode="HTML", reply_markup=get_back_keyboard(),
+    )
+    await state.set_state(States.waiting_for_api_id)
+
+
+@admin_router.message(States.waiting_for_api_id)
+async def get_api_id(message: Message, state: FSMContext) -> None:
+    text = message.text.strip() if message.text else ""
+    if not text.isdigit():
+        await message.answer("❌ API_ID — это число. Попробуйте ещё раз:", reply_markup=get_back_keyboard())
+        return
+    await state.update_data(api_id=int(text))
+    await message.answer(
+        f"✅ API_ID: <code>{text}</code>\n\nШаг 2/2: Введите <b>API_HASH</b>:",
+        parse_mode="HTML", reply_markup=get_back_keyboard(),
+    )
+    await state.set_state(States.waiting_for_api_hash)
+
+
+@admin_router.message(States.waiting_for_api_hash)
+async def get_api_hash(message: Message, state: FSMContext) -> None:
+    api_hash = message.text.strip() if message.text else ""
+    if len(api_hash) < 10:
+        await message.answer("❌ API_HASH слишком короткий. Скопируйте с my.telegram.org:",
+                             reply_markup=get_back_keyboard())
+        return
+    data = await state.get_data()
+    api_id: int = data["api_id"]
+    await db.save_api_settings(api_id, api_hash)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>API настроен!</b>\n\n"
+        f"API_ID: <code>{api_id}</code>\n"
+        f"API_HASH: <code>{api_hash}</code>\n\n"
+        f"Теперь добавьте аккаунт через <b>📱 Добавить аккаунт</b>.",
+        parse_mode="HTML", reply_markup=get_main_keyboard(),
+    )
