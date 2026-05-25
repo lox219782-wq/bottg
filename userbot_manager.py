@@ -9,8 +9,10 @@ async def start_mailing(phone, session_string, text, numbers, interval):
     async with app:
         for number in numbers:
             try:
+                # Добавляем контакт, чтобы телеграм меньше блокировал
                 await app.import_contacts([{"phone_number": number, "first_name": "User"}])
                 await app.send_message(number, text)
+                print(f"[Успех] Аккаунт {phone} написал {number}")
                 await asyncio.sleep(interval)
             except Exception as e:
-                print(f"Ошибка {phone}: {e}")
+                print(f"[Ошибка] {phone} -> {number}: {e}")
