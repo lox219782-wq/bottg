@@ -42,7 +42,6 @@ async def main() -> None:
     if not ADMIN_IDS:
         logger.warning("ADMIN_IDS не задан — бот не будет отвечать ни одному пользователю!")
 
-    # Инициализация БД до запуска бота — таблицы создаются гарантированно
     logger.info("Инициализация базы данных...")
     try:
         await db.init_db()
@@ -50,6 +49,14 @@ async def main() -> None:
     except Exception as e:
         logger.error("Ошибка инициализации БД: %s", e)
         sys.exit(1)
+
+    logger.info("Загрузка сохранённых аккаунтов...")
+    try:
+        await ub_mgr.load_all_accounts()
+        accounts = await db.get_all_accounts()
+        logger.info("Загружено аккаунтов: %d", len(accounts))
+    except Exception as e:
+        logger.warning("Не удалось загрузить часть аккаунтов: %s", e)
 
     bot = Bot(
         token=BOT_TOKEN,
