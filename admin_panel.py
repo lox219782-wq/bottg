@@ -42,9 +42,9 @@ class MainStates(StatesGroup):
 def get_main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="👥 Аккаунты"), KeyboardButton(text="📊 Статистика")],
+            [KeyboardButton(text="👥 Аккаунты"), KeyboardButton(text="📱 Добавить аккаунт")],
+            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Настройка API")],
             [KeyboardButton(text="🚀 Запустить рекламу"), KeyboardButton(text="🔍 Проверить базу")],
-            [KeyboardButton(text="⚙️ Настройка API")],
         ],
         resize_keyboard=True,
     )
