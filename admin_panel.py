@@ -1,4 +1,6 @@
 import asyncio
+import inspect
+import logging
 import os
 from aiogram import Router, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, Document
@@ -11,9 +13,13 @@ import database as db
 import userbot_manager as ub_mgr
 from config import ADMIN_IDS, UPLOADS_DIR
 
+logger = logging.getLogger(__name__)
 admin_router = Router()
 
 BACK = "🔙 Назад"
+STOP_BTN = "🛑 Остановить рассылку"
+
+_mailing_task: asyncio.Task | None = None
 
 
 class IsAdmin(Filter):
@@ -24,15 +30,18 @@ class IsAdmin(Filter):
 admin_router.message.filter(IsAdmin())
 
 
-class MainStates(StatesGroup):
+class States(StatesGroup):
+    # Добавление аккаунта
     waiting_for_phone = State()
     waiting_for_code = State()
     waiting_for_2fa = State()
-    waiting_for_mailing_text = State()
-    waiting_for_mailing_file = State()
+    # Настройка API
     waiting_for_api_id = State()
     waiting_for_api_hash = State()
-    waiting_for_check_file = State()
+    # Рассылка
+    waiting_for_mailing_file = State()
+    waiting_for_mailing_text = State()
+    waiting_for_mailing_interval = State()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -44,7 +53,7 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="👥 Аккаунты"), KeyboardButton(text="📱 Добавить аккаунт")],
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Настройка API")],
-            [KeyboardButton(text="🚀 Запустить рекламу"), KeyboardButton(text="🔍 Проверить базу")],
+            [KeyboardButton(text="🚀 Запустить рассылку")],
         ],
         resize_keyboard=True,
     )
@@ -57,18 +66,24 @@ def get_back_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def get_stop_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=STOP_BTN)]],
+        resize_keyboard=True,
+    )
+
+
 # ──────────────────────────────────────────────────────────────
-# УНИВЕРСАЛЬНАЯ КНОПКА НАЗАД — работает в любом состоянии
+# НАЗАД — любое состояние
 # ──────────────────────────────────────────────────────────────
 
 @admin_router.message(F.text == BACK)
 async def go_back(message: Message, state: FSMContext) -> None:
     current = await state.get_state()
-
     if current in (
-        MainStates.waiting_for_phone,
-        MainStates.waiting_for_code,
-        MainStates.waiting_for_2fa,
+        States.waiting_for_phone,
+        States.waiting_for_code,
+        States.waiting_for_2fa,
     ):
         data = await state.get_data()
         phone = data.get("phone")
@@ -79,7 +94,6 @@ async def go_back(message: Message, state: FSMContext) -> None:
                     await client.disconnect()
                 except Exception:
                     pass
-
     await state.clear()
     await message.answer("🏠 Главное меню", reply_markup=get_main_keyboard())
 
@@ -92,8 +106,7 @@ async def go_back(message: Message, state: FSMContext) -> None:
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "👋 Добро пожаловать в панель управления UserBot-рассылкой!\n\n"
-        "Выберите действие из меню ниже:",
+        "👋 Добро пожаловать!\n\nВыберите действие:",
         reply_markup=get_main_keyboard(),
     )
 
@@ -105,36 +118,28 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 @admin_router.message(F.text == "👥 Аккаунты")
 async def show_accounts(message: Message) -> None:
     accounts = await db.get_all_accounts()
-
     if not accounts:
         await message.answer(
             "👥 <b>Аккаунты</b>\n\n"
             "❌ Нет добавленных аккаунтов.\n\n"
-            "Нажмите <b>📱 Добавить аккаунт</b>, чтобы войти в Telegram-аккаунт прямо здесь в боте.\n"
-            "Сессия сохранится в базе данных и не потеряется при перезапуске.",
+            "Нажмите <b>📱 Добавить аккаунт</b>.",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(),
         )
         return
-
     lines = [f"👥 <b>Аккаунты ({len(accounts)})</b>\n"]
     for acc in accounts:
-        status = "🟢" if acc.get("active", True) else "🔴"
+        status = "🟢" if acc.get("active", 1) else "🔴"
         lines.append(
             f"{status} <code>{acc['phone']}</code>\n"
             f"   📤 Отправлено: {acc['sent_count']}\n"
             f"   📅 Добавлен: {str(acc.get('added_at', ''))[:10]}"
         )
-
-    await message.answer(
-        "\n\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(),
-    )
+    await message.answer("\n\n".join(lines), parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
 # ──────────────────────────────────────────────────────────────
-# ШАГ 1: Номер телефона
+# 2. ДОБАВИТЬ АККАУНТ
 # ──────────────────────────────────────────────────────────────
 
 @admin_router.message(F.text == "📱 Добавить аккаунт")
@@ -153,77 +158,57 @@ async def add_account_start(message: Message, state: FSMContext) -> None:
         parse_mode="HTML",
         reply_markup=get_back_keyboard(),
     )
-    await state.set_state(MainStates.waiting_for_phone)
+    await state.set_state(States.waiting_for_phone)
 
 
-@admin_router.message(MainStates.waiting_for_phone)
+@admin_router.message(States.waiting_for_phone)
 async def add_acc_phone(message: Message, state: FSMContext) -> None:
     phone = message.text.strip() if message.text else ""
     if not phone.startswith("+") or not phone[1:].isdigit() or len(phone) < 10:
         await message.answer(
-            "❌ Некорректный номер.\nВведите в формате <code>+79001234567</code>:",
+            "❌ Некорректный номер. Формат: <code>+79001234567</code>",
             parse_mode="HTML",
             reply_markup=get_back_keyboard(),
         )
         return
 
     api_id, api_hash = await db.get_api_settings()
-    if not api_id or not api_hash:
-        await message.answer(
-            "⚠️ API не настроен. Перейдите в <b>⚙️ Настройка API</b>.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(),
-        )
-        await state.clear()
-        return
+    await message.answer("⏳ Отправляю код...", reply_markup=get_back_keyboard())
 
-    await message.answer("⏳ Отправляю код подтверждения...", reply_markup=get_back_keyboard())
-
-    # Используем StringSession("") — сессия хранится в памяти,
-    # строку экспортируем после входа и сохраняем в БД
     client = Client(
         name=f"temp_{phone.replace('+', '')}",
         api_id=api_id,
         api_hash=api_hash,
-        session_string="",  # пустая строка = новая StringSession
         in_memory=True,
+        no_updates=True,
     )
-
     try:
         await client.connect()
         sent = await client.send_code(phone)
         ub_mgr._clients[f"__temp_{phone}"] = client
-        await state.update_data(
-            phone=phone,
-            api_id=api_id,
-            api_hash=api_hash,
-            phone_code_hash=sent.phone_code_hash,
-        )
+        await state.update_data(phone=phone, api_id=api_id, api_hash=api_hash,
+                                phone_code_hash=sent.phone_code_hash)
         await message.answer(
             "📨 Код отправлен в Telegram.\n\n"
-            "Введите код <b>без пробелов</b> (например: <code>12345</code>):",
+            "Введите код без пробелов (например: <code>12345</code>):",
             parse_mode="HTML",
             reply_markup=get_back_keyboard(),
         )
-        await state.set_state(MainStates.waiting_for_code)
+        await state.set_state(States.waiting_for_code)
     except Exception as e:
         try:
             await client.disconnect()
         except Exception:
             pass
         await message.answer(
-            f"❌ Ошибка при отправке кода: <code>{e}</code>",
+            f"❌ Ошибка: <code>{e}</code>",
             parse_mode="HTML",
             reply_markup=get_main_keyboard(),
         )
         await state.clear()
 
 
-# ──────────────────────────────────────────────────────────────
-# ШАГ 2: Код подтверждения
-# ──────────────────────────────────────────────────────────────
-
-@admin_router.message(MainStates.waiting_for_code)
+@admin_router.message(States.waiting_for_code)
 async def add_acc_code(message: Message, state: FSMContext) -> None:
     code = "".join((message.text or "").split())
     data = await state.get_data()
@@ -233,10 +218,7 @@ async def add_acc_code(message: Message, state: FSMContext) -> None:
     api_hash: str = data["api_hash"]
 
     if not code.isdigit():
-        await message.answer(
-            "❌ Код должен содержать только цифры. Введите ещё раз:",
-            reply_markup=get_back_keyboard(),
-        )
+        await message.answer("❌ Только цифры. Попробуйте ещё раз:", reply_markup=get_back_keyboard())
         return
 
     client: Client | None = ub_mgr._clients.get(f"__temp_{phone}")
@@ -248,66 +230,42 @@ async def add_acc_code(message: Message, state: FSMContext) -> None:
     try:
         await client.sign_in(phone, phone_code_hash, code)
         await _finalize_account(message, state, client, phone, api_id, api_hash)
-
     except SessionPasswordNeeded:
-        await message.answer(
-            "🔐 На аккаунте включена двухфакторная аутентификация.\n\nВведите пароль 2FA:",
-            reply_markup=get_back_keyboard(),
-        )
-        await state.set_state(MainStates.waiting_for_2fa)
-
+        await message.answer("🔐 Введите пароль 2FA:", reply_markup=get_back_keyboard())
+        await state.set_state(States.waiting_for_2fa)
     except PhoneCodeExpired:
-        await _cleanup_temp_client(phone)
+        await _cleanup_temp(phone)
         await message.answer(
-            "⏰ Код истёк (Telegram даёт ~2 минуты).\n\n"
-            "Нажмите <b>📱 Добавить аккаунт</b> и запросите новый код.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(),
+            "⏰ Код истёк. Нажмите <b>📱 Добавить аккаунт</b> снова.",
+            parse_mode="HTML", reply_markup=get_main_keyboard(),
         )
         await state.clear()
-
     except PhoneCodeInvalid:
-        await message.answer(
-            "❌ Неверный код. Проверьте цифры и введите ещё раз:",
-            reply_markup=get_back_keyboard(),
-        )
-
+        await message.answer("❌ Неверный код. Попробуйте ещё раз:", reply_markup=get_back_keyboard())
     except Exception as e:
         err = str(e)
         if "SESSION_PASSWORD_NEEDED" in err:
-            await message.answer(
-                "🔐 Требуется пароль 2FA. Введите пароль:",
-                reply_markup=get_back_keyboard(),
-            )
-            await state.set_state(MainStates.waiting_for_2fa)
+            await message.answer("🔐 Введите пароль 2FA:", reply_markup=get_back_keyboard())
+            await state.set_state(States.waiting_for_2fa)
         elif "PHONE_CODE_EXPIRED" in err:
-            await _cleanup_temp_client(phone)
+            await _cleanup_temp(phone)
             await message.answer(
-                "⏰ Код истёк. Нажмите <b>📱 Добавить аккаунт</b> и попробуйте снова.",
-                parse_mode="HTML",
-                reply_markup=get_main_keyboard(),
+                "⏰ Код истёк. Нажмите <b>📱 Добавить аккаунт</b> снова.",
+                parse_mode="HTML", reply_markup=get_main_keyboard(),
             )
             await state.clear()
         elif "PHONE_CODE_INVALID" in err:
-            await message.answer(
-                "❌ Неверный код. Проверьте цифры и введите ещё раз:",
-                reply_markup=get_back_keyboard(),
-            )
+            await message.answer("❌ Неверный код. Попробуйте ещё раз:", reply_markup=get_back_keyboard())
         else:
-            await _cleanup_temp_client(phone)
+            await _cleanup_temp(phone)
             await message.answer(
-                f"❌ Ошибка при входе:\n<code>{e}</code>\n\nПопробуйте заново.",
-                parse_mode="HTML",
-                reply_markup=get_main_keyboard(),
+                f"❌ Ошибка: <code>{e}</code>",
+                parse_mode="HTML", reply_markup=get_main_keyboard(),
             )
             await state.clear()
 
 
-# ──────────────────────────────────────────────────────────────
-# ШАГ 3 (опционально): Пароль 2FA
-# ──────────────────────────────────────────────────────────────
-
-@admin_router.message(MainStates.waiting_for_2fa)
+@admin_router.message(States.waiting_for_2fa)
 async def add_acc_2fa(message: Message, state: FSMContext) -> None:
     password = message.text.strip() if message.text else ""
     data = await state.get_data()
@@ -326,55 +284,45 @@ async def add_acc_2fa(message: Message, state: FSMContext) -> None:
         await _finalize_account(message, state, client, phone, api_id, api_hash)
     except Exception as e:
         await message.answer(
-            f"❌ Неверный пароль 2FA: <code>{e}</code>\n\nПопробуйте ещё раз:",
-            parse_mode="HTML",
-            reply_markup=get_back_keyboard(),
+            f"❌ Неверный пароль: <code>{e}</code>\n\nПопробуйте ещё раз:",
+            parse_mode="HTML", reply_markup=get_back_keyboard(),
         )
 
-
-# ──────────────────────────────────────────────────────────────
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ──────────────────────────────────────────────────────────────
 
 async def _finalize_account(
-    message: Message,
-    state: FSMContext,
-    client: Client,
-    phone: str,
-    api_id: int,
-    api_hash: str,
+    message: Message, state: FSMContext, client: Client,
+    phone: str, api_id: int, api_hash: str,
 ) -> None:
-    """Экспортируем StringSession, сохраняем в БД и регистрируем клиент."""
     try:
-        session_string = await client.export_session_string()
+        raw_result = client.export_session_string()
+        session_string = await raw_result if inspect.isawaitable(raw_result) else raw_result
     except Exception as e:
-        await _cleanup_temp_client(phone)
-        await message.answer(
-            f"❌ Не удалось экспортировать сессию: <code>{e}</code>",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(),
-        )
+        await _cleanup_temp(phone)
+        await message.answer(f"❌ Ошибка экспорта сессии: <code>{e}</code>", parse_mode="HTML",
+                             reply_markup=get_main_keyboard())
         await state.clear()
         return
 
-    # Сохраняем строку сессии в базу данных — она не потеряется при перезапуске
-    await db.add_account(phone, session_string, api_id, api_hash)
+    if not session_string:
+        await _cleanup_temp(phone)
+        await message.answer("❌ Сессия пустая — попробуйте добавить аккаунт заново.",
+                             reply_markup=get_main_keyboard())
+        await state.clear()
+        return
 
-    # Переносим клиент из временного хранилища в постоянное
+    await db.add_account(phone, session_string, api_id, api_hash)
     ub_mgr._clients[phone] = client
     ub_mgr._clients.pop(f"__temp_{phone}", None)
 
     await message.answer(
-        f"✅ Аккаунт <code>{phone}</code> успешно добавлен!\n\n"
-        f"Сессия сохранена в базу данных — аккаунт останется активным после перезапуска.",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(),
+        f"✅ Аккаунт <code>{phone}</code> добавлен!\n"
+        f"Сессия сохранена в базу данных.",
+        parse_mode="HTML", reply_markup=get_main_keyboard(),
     )
     await state.clear()
 
 
-async def _cleanup_temp_client(phone: str) -> None:
-    """Закрываем и удаляем временный клиент."""
+async def _cleanup_temp(phone: str) -> None:
     client = ub_mgr._clients.pop(f"__temp_{phone}", None)
     if client:
         try:
@@ -384,56 +332,45 @@ async def _cleanup_temp_client(phone: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# 2. ЗАПУСТИТЬ РЕКЛАМУ
+# 3. РАССЫЛКА
 # ──────────────────────────────────────────────────────────────
 
-@admin_router.message(F.text == "🚀 Запустить рекламу")
+@admin_router.message(F.text == "🚀 Запустить рассылку")
 async def mailing_start(message: Message, state: FSMContext) -> None:
+    global _mailing_task
+    if _mailing_task and not _mailing_task.done():
+        await message.answer(
+            "⚠️ Рассылка уже запущена!\n\nНажмите <b>🛑 Остановить рассылку</b> чтобы её остановить.",
+            parse_mode="HTML",
+            reply_markup=get_stop_keyboard(),
+        )
+        return
+
     accounts = await db.get_all_accounts()
     if not accounts:
         await message.answer(
-            "⚠️ Нет активных аккаунтов.\n"
-            "Сначала добавьте аккаунт через <b>📱 Добавить аккаунт</b>.",
+            "⚠️ Нет активных аккаунтов.\nДобавьте аккаунт через <b>📱 Добавить аккаунт</b>.",
             parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
         )
         return
+
     await message.answer(
-        "🚀 <b>Запуск рассылки</b>\n\n"
-        "Шаг 1/2: Введите текст сообщения, которое будет отправлено контактам:",
+        "📂 <b>Рассылка — Шаг 1/3</b>\n\n"
+        "Отправьте <b>.txt файл</b> со списком номеров телефонов\n"
+        "(один номер на строку, формат: +79001234567)",
         parse_mode="HTML",
         reply_markup=get_back_keyboard(),
     )
-    await state.set_state(MainStates.waiting_for_mailing_text)
+    await state.set_state(States.waiting_for_mailing_file)
 
 
-@admin_router.message(MainStates.waiting_for_mailing_text)
-async def mailing_text(message: Message, state: FSMContext) -> None:
-    if not message.text:
-        await message.answer(
-            "❌ Пожалуйста, введите текстовое сообщение:",
-            reply_markup=get_back_keyboard(),
-        )
-        return
-    await state.update_data(mailing_text=message.text)
-    await message.answer(
-        f"✅ Текст сохранён.\n\n"
-        f"Шаг 2/2: Отправьте <b>.txt файл</b> со списком контактов\n"
-        f"(один номер или @username на строку):",
-        parse_mode="HTML",
-        reply_markup=get_back_keyboard(),
-    )
-    await state.set_state(MainStates.waiting_for_mailing_file)
-
-
-@admin_router.message(MainStates.waiting_for_mailing_file, F.document)
-async def mailing_file(message: Message, state: FSMContext) -> None:
+@admin_router.message(States.waiting_for_mailing_file, F.document)
+async def mailing_got_file(message: Message, state: FSMContext) -> None:
     doc: Document = message.document
     if not doc.file_name.endswith(".txt"):
-        await message.answer(
-            "❌ Нужен файл в формате <b>.txt</b>. Попробуйте ещё раз:",
-            parse_mode="HTML",
-            reply_markup=get_back_keyboard(),
-        )
+        await message.answer("❌ Нужен файл <b>.txt</b>. Попробуйте ещё раз:",
+                             parse_mode="HTML", reply_markup=get_back_keyboard())
         return
 
     os.makedirs(UPLOADS_DIR, exist_ok=True)
@@ -441,61 +378,199 @@ async def mailing_file(message: Message, state: FSMContext) -> None:
     await message.bot.download(doc, destination=file_path)
 
     with open(file_path, "r", encoding="utf-8") as f:
-        contacts = [line.strip() for line in f if line.strip()]
+        raw = [line.strip() for line in f if line.strip()]
 
-    if not contacts:
-        await message.answer(
-            "❌ Файл пустой или не содержит контактов.",
-            reply_markup=get_main_keyboard(),
-        )
+    numbers = []
+    for n in raw:
+        clean = n.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+        if clean.lstrip("+").isdigit() and len(clean) >= 10:
+            numbers.append(clean if clean.startswith("+") else f"+{clean}")
+
+    if not numbers:
+        await message.answer("❌ Файл не содержит телефонных номеров.",
+                             reply_markup=get_main_keyboard())
         await state.clear()
         return
 
-    data = await state.get_data()
-    text: str = data["mailing_text"]
-    await state.clear()
-
-    status_msg = await message.answer(
-        f"🚀 Начинаю рассылку по <b>{len(contacts)}</b> контактам...\n"
-        f"Пожалуйста, подождите — это может занять время.",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(),
-    )
-
-    async def progress(done: int, total: int, res: dict) -> None:
-        try:
-            await status_msg.edit_text(
-                f"⏳ <b>Рассылка в процессе...</b>\n\n"
-                f"Прогресс: {done}/{total}\n"
-                f"✅ Успешно: {res['ok']} | ❌ Ошибок: {res['fail']}",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    results = await ub_mgr.run_mailing(text, contacts, progress_callback=progress)
-
-    await status_msg.edit_text(
-        f"✅ <b>Рассылка завершена!</b>\n\n"
-        f"📤 Всего контактов: {len(contacts)}\n"
-        f"✅ Отправлено: {results['ok']}\n"
-        f"❌ Ошибок: {results['fail']}",
-        parse_mode="HTML",
-    )
-
-
-@admin_router.message(MainStates.waiting_for_mailing_file)
-async def mailing_file_wrong(message: Message) -> None:
+    await state.update_data(numbers=numbers)
     await message.answer(
-        "❌ Ожидается <b>.txt файл</b> — нажмите скрепку и выберите файл.\n"
-        "Или нажмите 🔙 Назад для отмены.",
+        f"✅ Загружено <b>{len(numbers)}</b> номеров.\n\n"
+        f"📝 <b>Шаг 2/3:</b> Введите текст сообщения для рассылки:",
         parse_mode="HTML",
         reply_markup=get_back_keyboard(),
+    )
+    await state.set_state(States.waiting_for_mailing_text)
+
+
+@admin_router.message(States.waiting_for_mailing_file)
+async def mailing_file_wrong(message: Message) -> None:
+    await message.answer("❌ Ожидается <b>.txt файл</b> — нажмите скрепку и выберите файл.",
+                         parse_mode="HTML", reply_markup=get_back_keyboard())
+
+
+@admin_router.message(States.waiting_for_mailing_text)
+async def mailing_got_text(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        await message.answer("❌ Введите текстовое сообщение:", reply_markup=get_back_keyboard())
+        return
+    await state.update_data(mailing_text=message.text)
+    await message.answer(
+        f"✅ Текст сохранён.\n\n"
+        f"⏱ <b>Шаг 3/3:</b> Введите интервал между сообщениями в <b>секундах</b>\n"
+        f"(например: <code>30</code> — одно сообщение каждые 30 сек)",
+        parse_mode="HTML",
+        reply_markup=get_back_keyboard(),
+    )
+    await state.set_state(States.waiting_for_mailing_interval)
+
+
+@admin_router.message(States.waiting_for_mailing_interval)
+async def mailing_got_interval(message: Message, state: FSMContext) -> None:
+    global _mailing_task
+
+    text = (message.text or "").strip()
+    if not text.isdigit() or int(text) < 1:
+        await message.answer(
+            "❌ Введите целое число секунд (минимум 1):",
+            reply_markup=get_back_keyboard(),
+        )
+        return
+
+    interval = int(text)
+    data = await state.get_data()
+    numbers: list[str] = data["numbers"]
+    mailing_text: str = data["mailing_text"]
+    await state.clear()
+
+    accounts = await db.get_all_accounts()
+
+    status_msg = await message.answer(
+        f"🚀 <b>Рассылка запущена!</b>\n\n"
+        f"📋 Номеров: <b>{len(numbers)}</b>\n"
+        f"⏱ Интервал: <b>{interval} сек</b>\n"
+        f"👤 Аккаунтов: <b>{len(accounts)}</b>\n\n"
+        f"Прогресс: 0/{len(numbers)}",
+        parse_mode="HTML",
+        reply_markup=get_stop_keyboard(),
+    )
+
+    _mailing_task = asyncio.create_task(
+        _run_mailing(
+            bot=message.bot,
+            chat_id=message.chat.id,
+            status_msg=status_msg,
+            numbers=numbers,
+            text=mailing_text,
+            interval=interval,
+            accounts=accounts,
+        )
+    )
+
+
+async def _run_mailing(
+    bot, chat_id: int, status_msg, numbers: list[str],
+    text: str, interval: int, accounts: list[dict],
+) -> None:
+    ok = 0
+    fail = 0
+    stopped = False
+    total = len(numbers)
+
+    for i, phone in enumerate(numbers):
+        if _mailing_task and _mailing_task.cancelled():
+            stopped = True
+            break
+
+        account = accounts[i % len(accounts)]
+        try:
+            client = await ub_mgr.get_client(
+                account["phone"], account["api_id"], account["api_hash"]
+            )
+            status = await ub_mgr.send_to_phone(client, account["phone"], phone, text)
+            if status == "ok":
+                ok += 1
+            else:
+                fail += 1
+        except Exception as e:
+            logger.warning("Ошибка при отправке на %s: %s", phone, e)
+            fail += 1
+
+        # Обновляем статус каждые 5 сообщений или в конце
+        if (i + 1) % 5 == 0 or (i + 1) == total:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ <b>Рассылка в процессе...</b>\n\n"
+                    f"Прогресс: {i + 1}/{total}\n"
+                    f"✅ Успешно: {ok} | ❌ Ошибок: {fail}",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+
+        if i < total - 1:
+            await asyncio.sleep(interval)
+
+    if stopped:
+        result_text = (
+            f"🛑 <b>Рассылка остановлена</b>\n\n"
+            f"Отправлено: {ok + fail}/{total}\n"
+            f"✅ Успешно: {ok} | ❌ Ошибок: {fail}"
+        )
+    else:
+        result_text = (
+            f"✅ <b>Рассылка завершена!</b>\n\n"
+            f"📋 Всего номеров: {total}\n"
+            f"✅ Успешно: {ok}\n"
+            f"❌ Ошибок: {fail}"
+        )
+
+    try:
+        await status_msg.edit_text(result_text, parse_mode="HTML")
+    except Exception:
+        pass
+
+    try:
+        await bot.send_message(chat_id, result_text, parse_mode="HTML",
+                               reply_markup=ReplyKeyboardMarkup(
+                                   keyboard=[[KeyboardButton(text="🚀 Запустить рассылку")]],
+                                   resize_keyboard=True,
+                               ))
+        # Восстанавливаем полное меню
+        await bot.send_message(chat_id, "🏠 Главное меню", reply_markup=_main_keyboard())
+    except Exception:
+        pass
+
+
+def _main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👥 Аккаунты"), KeyboardButton(text="📱 Добавить аккаунт")],
+            [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Настройка API")],
+            [KeyboardButton(text="🚀 Запустить рассылку")],
+        ],
+        resize_keyboard=True,
     )
 
 
 # ──────────────────────────────────────────────────────────────
-# 3. СТАТИСТИКА
+# СТОП
+# ──────────────────────────────────────────────────────────────
+
+@admin_router.message(F.text == STOP_BTN)
+async def mailing_stop(message: Message) -> None:
+    global _mailing_task
+    if _mailing_task and not _mailing_task.done():
+        _mailing_task.cancel()
+        await message.answer(
+            "🛑 Рассылка остановлена.\n\nИтоги появятся через секунду.",
+            reply_markup=get_main_keyboard(),
+        )
+    else:
+        await message.answer("ℹ️ Рассылка не запущена.", reply_markup=get_main_keyboard())
+
+
+# ──────────────────────────────────────────────────────────────
+# 4. СТАТИСТИКА
 # ──────────────────────────────────────────────────────────────
 
 @admin_router.message(F.text == "📊 Статистика")
@@ -506,16 +581,19 @@ async def show_stats(message: Message) -> None:
     lines = [
         "📊 <b>Статистика</b>\n",
         f"🟢 Активных аккаунтов: <b>{stats['active']}</b>",
-        f"🔴 Отключённых аккаунтов: <b>{stats['inactive']}</b>",
-        f"👥 Контактов в базе (с Telegram): <b>{stats['contacts']}</b>",
-        f"📤 Всего отправлено сообщений: <b>{stats['total_sent']}</b>",
+        f"🔴 Отключённых: <b>{stats['inactive']}</b>",
+        f"📤 Всего отправлено: <b>{stats['total_sent']}</b>",
         f"📅 Отправлено сегодня: <b>{stats['sent_today']}</b>",
     ]
+
+    global _mailing_task
+    if _mailing_task and not _mailing_task.done():
+        lines.append("\n🔄 <b>Рассылка сейчас активна</b>")
 
     if accounts:
         lines.append("\n<b>Аккаунты:</b>")
         for acc in accounts:
-            status = "🟢" if acc["active"] else "🔴"
+            status = "🟢" if acc.get("active", 1) else "🔴"
             lines.append(f"  {status} <code>{acc['phone']}</code> — отправлено: {acc['sent_count']}")
     else:
         lines.append("\n<i>Аккаунты не добавлены</i>")
@@ -524,205 +602,58 @@ async def show_stats(message: Message) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
-# 4. НАСТРОЙКА API
+# 5. НАСТРОЙКА API
 # ──────────────────────────────────────────────────────────────
 
 @admin_router.message(F.text == "⚙️ Настройка API")
 async def api_settings_start(message: Message, state: FSMContext) -> None:
     current = await db.get_api_settings()
     status = (
-        f"\n\n<i>Текущий API_ID: <code>{current[0]}</code></i>" if current
+        f"\n\n<i>Текущий API_ID: <code>{current[0]}</code></i>" if current[0]
         else "\n\n<i>API ещё не настроен</i>"
     )
     await message.answer(
         f"⚙️ <b>Настройка API Telegram</b>{status}\n\n"
         f"Шаг 1/2: Введите <b>API_ID</b>\n"
-        f"Получить на сайте: my.telegram.org → App configuration",
+        f"Получить: my.telegram.org → App configuration",
         parse_mode="HTML",
         reply_markup=get_back_keyboard(),
     )
-    await state.set_state(MainStates.waiting_for_api_id)
+    await state.set_state(States.waiting_for_api_id)
 
 
-@admin_router.message(MainStates.waiting_for_api_id)
+@admin_router.message(States.waiting_for_api_id)
 async def get_api_id(message: Message, state: FSMContext) -> None:
     text = message.text.strip() if message.text else ""
     if not text.isdigit():
-        await message.answer(
-            "❌ API_ID — это число (например: <code>1234567</code>).\nПопробуйте ещё раз:",
-            parse_mode="HTML",
-            reply_markup=get_back_keyboard(),
-        )
+        await message.answer("❌ API_ID — это число. Попробуйте ещё раз:",
+                             reply_markup=get_back_keyboard())
         return
     await state.update_data(api_id=int(text))
     await message.answer(
-        f"✅ API_ID сохранён: <code>{text}</code>\n\n"
-        f"Шаг 2/2: Введите <b>API_HASH</b>\n"
-        f"(строка вида: <code>abc123def456...</code>)",
+        f"✅ API_ID: <code>{text}</code>\n\nШаг 2/2: Введите <b>API_HASH</b>:",
         parse_mode="HTML",
         reply_markup=get_back_keyboard(),
     )
-    await state.set_state(MainStates.waiting_for_api_hash)
+    await state.set_state(States.waiting_for_api_hash)
 
 
-@admin_router.message(MainStates.waiting_for_api_hash)
+@admin_router.message(States.waiting_for_api_hash)
 async def get_api_hash(message: Message, state: FSMContext) -> None:
     api_hash = message.text.strip() if message.text else ""
     if len(api_hash) < 10:
-        await message.answer(
-            "❌ API_HASH слишком короткий. Скопируйте его с my.telegram.org:",
-            reply_markup=get_back_keyboard(),
-        )
+        await message.answer("❌ API_HASH слишком короткий. Скопируйте с my.telegram.org:",
+                             reply_markup=get_back_keyboard())
         return
     data = await state.get_data()
     api_id: int = data["api_id"]
     await db.save_api_settings(api_id, api_hash)
     await state.clear()
     await message.answer(
-        f"✅ <b>API успешно настроен!</b>\n\n"
+        f"✅ <b>API настроен!</b>\n\n"
         f"API_ID: <code>{api_id}</code>\n"
         f"API_HASH: <code>{api_hash}</code>\n\n"
-        f"Теперь можно добавлять аккаунты через <b>📱 Добавить аккаунт</b>.",
+        f"Теперь добавьте аккаунт через <b>📱 Добавить аккаунт</b>.",
         parse_mode="HTML",
         reply_markup=get_main_keyboard(),
-    )
-
-
-# ──────────────────────────────────────────────────────────────
-# 5. ПРОВЕРИТЬ БАЗУ (проверка номеров на наличие Telegram)
-# ──────────────────────────────────────────────────────────────
-
-@admin_router.message(F.text == "🔍 Проверить базу")
-async def check_base_start(message: Message, state: FSMContext) -> None:
-    accounts = await db.get_all_accounts()
-    if not accounts:
-        await message.answer(
-            "⚠️ Нет активных аккаунтов для проверки.\n"
-            "Сначала добавьте аккаунт через <b>📱 Добавить аккаунт</b>.",
-            parse_mode="HTML",
-        )
-        return
-
-    contacts_count = await db.get_contacts_count()
-    hint = ""
-    if contacts_count:
-        hint = f"\n\n📋 Уже в базе: <b>{contacts_count}</b> контактов с Telegram"
-
-    await message.answer(
-        "🔍 <b>Проверка базы номеров</b>\n\n"
-        "Отправьте <b>.txt файл</b> со списком номеров телефонов\n"
-        "(один номер на строку, формат: +79001234567).\n\n"
-        "Бот проверит каждый номер — есть ли у него Telegram,\n"
-        "и сохранит найденных в базу для рассылки."
-        f"{hint}",
-        parse_mode="HTML",
-        reply_markup=get_back_keyboard(),
-    )
-    await state.set_state(MainStates.waiting_for_check_file)
-
-
-@admin_router.message(MainStates.waiting_for_check_file, F.document)
-async def check_base_file(message: Message, state: FSMContext) -> None:
-    doc: Document = message.document
-    if not doc.file_name.endswith(".txt"):
-        await message.answer(
-            "❌ Нужен файл в формате <b>.txt</b>. Попробуйте ещё раз:",
-            parse_mode="HTML",
-            reply_markup=get_back_keyboard(),
-        )
-        return
-
-    os.makedirs(UPLOADS_DIR, exist_ok=True)
-    file_path = os.path.join(UPLOADS_DIR, f"check_{doc.file_name}")
-    await message.bot.download(doc, destination=file_path)
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        raw_lines = [line.strip() for line in f if line.strip()]
-
-    numbers = []
-    for n in raw_lines:
-        if n.lstrip("+").isdigit():
-            numbers.append(n if n.startswith("+") else f"+{n}")
-
-    await state.clear()
-
-    if not numbers:
-        await message.answer(
-            "❌ Файл пустой или не содержит телефонных номеров.",
-            reply_markup=get_main_keyboard(),
-        )
-        return
-
-    status_msg = await message.answer(
-        f"🔍 Начинаю проверку <b>{len(numbers)}</b> номеров...\n"
-        f"⏳ Это займёт некоторое время.",
-        parse_mode="HTML",
-        reply_markup=get_main_keyboard(),
-    )
-
-    async def progress(done: int, total: int, found_count: int) -> None:
-        try:
-            await status_msg.edit_text(
-                f"🔍 <b>Проверка в процессе...</b>\n\n"
-                f"Обработано: {done}/{total}\n"
-                f"✅ Найдено с Telegram: {found_count}",
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    result = await ub_mgr.check_contacts(numbers, progress_callback=progress)
-
-    if "error" in result:
-        await status_msg.edit_text(
-            f"❌ <b>Ошибка при проверке:</b>\n<code>{result['error']}</code>\n\n"
-            f"Попробуйте удалить аккаунт и добавить заново через <b>📱 Добавить аккаунт</b>.",
-            parse_mode="HTML",
-            reply_markup=get_main_keyboard(),
-        )
-        return
-
-    found = result["found"]
-    new_count = 0
-    if found:
-        new_count = await db.save_contacts(found)
-
-    total_in_db = await db.get_contacts_count()
-
-    lines = [
-        "✅ <b>Проверка завершена!</b>\n",
-        f"📋 Всего номеров в файле: <b>{len(numbers)}</b>",
-        f"✅ Есть Telegram: <b>{len(found)}</b>",
-        f"❌ Нет Telegram: <b>{result['not_found']}</b>",
-        f"🆕 Новых добавлено в базу: <b>{new_count}</b>",
-        f"📊 Всего в базе контактов: <b>{total_in_db}</b>",
-    ]
-
-    if result.get("errors", 0) > 0:
-        lines.append(f"\n⚠️ Ошибок при обработке: <b>{result['errors']}</b>")
-        if result.get("last_error"):
-            lines.append(f"<i>Последняя ошибка: {result['last_error']}</i>")
-
-    if found[:5]:
-        lines.append("\n<b>Примеры найденных:</b>")
-        for c in found[:5]:
-            name = c.get("first_name") or ""
-            username = f" @{c['username']}" if c.get("username") else ""
-            lines.append(f"  ✅ <code>{c['phone']}</code> {name}{username}")
-        if len(found) > 5:
-            lines.append(f"  <i>... и ещё {len(found) - 5}</i>")
-
-    await status_msg.edit_text(
-        "\n".join(lines),
-        parse_mode="HTML",
-    )
-
-
-@admin_router.message(MainStates.waiting_for_check_file)
-async def check_base_wrong(message: Message) -> None:
-    await message.answer(
-        "❌ Ожидается <b>.txt файл</b> — нажмите скрепку и выберите файл.\n"
-        "Или нажмите 🔙 Назад для отмены.",
-        parse_mode="HTML",
-        reply_markup=get_back_keyboard(),
     )
