@@ -25,10 +25,27 @@ jobs:
       - name: Create directories
         run: mkdir -p sessions uploads
 
+      - name: Restore sessions from secrets
+        env:
+          SESSIONS_B64: "${{ secrets.SESSIONS_B64 }}"
+          DB_B64: "${{ secrets.DB_B64 }}"
+        run: |
+          if [ -n "$SESSIONS_B64" ]; then
+            echo "$SESSIONS_B64" | base64 -d > sessions.tar.gz
+            tar -xzf sessions.tar.gz -C sessions/ 2>/dev/null || true
+            echo "Sessions restored"
+          fi
+          if [ -n "$DB_B64" ]; then
+            echo "$DB_B64" | base64 -d > bot.db
+            echo "Database restored"
+          fi
+
       - name: Start bot
         env:
           BOT_TOKEN: "${{ secrets.BOT_TOKEN }}"
           ADMIN_IDS: "${{ secrets.ADMIN_IDS }}"
+          API_ID: "${{ secrets.API_ID }}"
+          API_HASH: "${{ secrets.API_HASH }}"
           DB_PATH: "bot.db"
           SESSIONS_DIR: "sessions"
           UPLOADS_DIR: "uploads"
