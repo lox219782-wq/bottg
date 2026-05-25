@@ -675,7 +675,10 @@ async def check_base_file(message: Message, state: FSMContext) -> None:
 
     if "error" in result:
         await status_msg.edit_text(
-            f"❌ Ошибка: {result['error']}",
+            f"❌ <b>Ошибка при проверке:</b>\n<code>{result['error']}</code>\n\n"
+            f"Попробуйте удалить аккаунт и добавить заново через <b>📱 Добавить аккаунт</b>.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
         )
         return
 
@@ -694,6 +697,11 @@ async def check_base_file(message: Message, state: FSMContext) -> None:
         f"🆕 Новых добавлено в базу: <b>{new_count}</b>",
         f"📊 Всего в базе контактов: <b>{total_in_db}</b>",
     ]
+
+    if result.get("errors", 0) > 0:
+        lines.append(f"\n⚠️ Ошибок при обработке: <b>{result['errors']}</b>")
+        if result.get("last_error"):
+            lines.append(f"<i>Последняя ошибка: {result['last_error']}</i>")
 
     if found[:5]:
         lines.append("\n<b>Примеры найденных:</b>")
