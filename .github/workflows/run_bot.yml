@@ -6,6 +6,10 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: bot-instance
+  cancel-in-progress: true
+
 jobs:
   bot:
     runs-on: ubuntu-latest
@@ -25,19 +29,25 @@ jobs:
       - name: Create directories
         run: mkdir -p sessions uploads
 
-      - name: Restore sessions from secrets
+      - name: Restore database (cache between runs)
+        uses: actions/cache@v4
+        with:
+          path: bot.db
+          key: bot-database-${{ github.run_id }}
+          restore-keys: |
+            bot-database-
+
+      - name: Restore database from secret (first launch fallback)
         env:
-          SESSIONS_B64: "${{ secrets.SESSIONS_B64 }}"
           DB_B64: "${{ secrets.DB_B64 }}"
         run: |
-          if [ -n "$SESSIONS_B64" ]; then
-            echo "$SESSIONS_B64" | base64 -d > sessions.tar.gz
-            tar -xzf sessions.tar.gz -C sessions/ 2>/dev/null || true
-            echo "Sessions restored"
-          fi
-          if [ -n "$DB_B64" ]; then
+          if [ ! -f bot.db ] && [ -n "$DB_B64" ]; then
             echo "$DB_B64" | base64 -d > bot.db
-            echo "Database restored"
+            echo "Database restored from DB_B64 secret"
+          elif [ -f bot.db ]; then
+            echo "Database restored from cache (accounts and sessions preserved)"
+          else
+            echo "Starting with fresh database"
           fi
 
       - name: Start bot
