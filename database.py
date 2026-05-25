@@ -17,11 +17,25 @@ def init_db():
     conn.commit()
     conn.close()
 
-def update_task(phone, text, interval):
+def get_api_credentials():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO tasks (phone, text, interval, status) VALUES (?, ?, ?, 'ready')", (phone, text, interval))
+    cursor.execute("SELECT key, value FROM api_settings")
+    data = dict(cursor.fetchall())
+    conn.close()
+    return data.get('api_id', '2040'), data.get('api_hash', 'b18441a1ff607e10a989891a5462e627')
+
+def add_userbot(phone, session_string):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO userbots (phone, session_string) VALUES (?, ?)", (phone, session_string))
     conn.commit()
     conn.close()
 
-# Добавь сюда остальные функции из старого файла (get_all_userbots, add_userbot, etc.)
+def get_all_userbots():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT phone, session_string FROM userbots")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
