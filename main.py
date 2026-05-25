@@ -7,7 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 import database as db
 import userbot_manager as ub_mgr
-from admin_router import admin_router
+from admin_panel import admin_router
 from config import BOT_TOKEN, ADMIN_IDS
 
 logging.basicConfig(
