@@ -94,27 +94,36 @@ async def send_to_phone(
             # client_id ОБЯЗАН быть уникальным случайным числом —
             # при client_id=0 Telegram дедуплицирует запрос и возвращает пустой users.
             contact_id = random.randint(1, 2**31 - 1)
-            result = await client.invoke(
-                raw.functions.contacts.ImportContacts(
-                    contacts=[
-                        raw.types.InputPhoneContact(
-                            client_id=contact_id,
-                            phone=recipient_phone,
-                            first_name="Contact",
-                            last_name="",
-                        )
-                    ]
-                )
+            logger.debug("Импортируем контакт %s (client_id=%d)", recipient_phone, contact_id)
+            result = await asyncio.wait_for(
+                client.invoke(
+                    raw.functions.contacts.ImportContacts(
+                        contacts=[
+                            raw.types.InputPhoneContact(
+                                client_id=contact_id,
+                                phone=recipient_phone,
+                                first_name="Contact",
+                                last_name="",
+                            )
+                        ]
+                    )
+                ),
+                timeout=30,
             )
 
             if not result.users:
+                logger.debug("Номер %s не в Telegram", recipient_phone)
                 return "no_telegram"
 
             user = result.users[0]
             user_id = user.id
+            logger.debug("Контакт найден: user_id=%d, отправляем сообщение", user_id)
 
             # Шаг 2: отправляем сообщение
-            await client.send_message(user_id, text)
+            await asyncio.wait_for(
+                client.send_message(user_id, text),
+                timeout=30,
+            )
             await db.log_mailing(sender_phone, recipient_phone, "ok")
             await db.increment_sent(sender_phone)
             return "ok"
