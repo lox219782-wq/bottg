@@ -1,6 +1,6 @@
-import random
 import asyncio
 import logging
+import random
 from pyrogram import Client, raw
 from pyrogram.errors import (
     FloodWait,
@@ -83,58 +83,61 @@ async def send_to_phone(
     Добавляет номер как контакт → отправляет сообщение → удаляет из контактов.
     Возвращает: 'ok', 'no_telegram', 'privacy', 'banned', 'error: ...'
     """
-    user_id = None
-    user = None
-
     for attempt in range(_max_retries):
         user_id = None
         user = None
         try:
-            # Шаг 1: добавляем номер в контакты.
             # client_id ОБЯЗАН быть уникальным случайным числом —
             # при client_id=0 Telegram дедуплицирует запрос и возвращает пустой users.
             contact_id = random.randint(1, 2**31 - 1)
-result = await asyncio.wait_for(
-    client.invoke(
-        raw.functions.contacts.ImportContacts(
-            contacts=[
-                raw.types.InputPhoneContact(
-                    client_id=contact_id,   # уникальный ID
-                    phone=recipient_phone,
-                    first_name="Contact",
-                    last_name="",
-                )
-            ]
-        )
-    ),
-    timeout=30,   # таймаут — не зависнет навсегда
+            logger.info("Отправка на %s (попытка %d)", recipient_phone, attempt + 1)
+
+            result = await asyncio.wait_for(
+                client.invoke(
+                    raw.functions.contacts.ImportContacts(
+                        contacts=[
+                            raw.types.InputPhoneContact(
+                                client_id=contact_id,
+                                phone=recipient_phone,
+                                first_name="Contact",
+                                last_name="",
+                            )
+                        ]
+                    )
+                ),
+                timeout=30,
             )
 
             if not result.users:
-                logger.debug("Номер %s не в Telegram", recipient_phone)
+                logger.info("Номер %s не в Telegram", recipient_phone)
                 return "no_telegram"
 
             user = result.users[0]
             user_id = user.id
-            logger.debug("Контакт найден: user_id=%d, отправляем сообщение", user_id)
 
-            # Шаг 2: отправляем сообщение
             await asyncio.wait_for(
                 client.send_message(user_id, text),
                 timeout=30,
             )
             await db.log_mailing(sender_phone, recipient_phone, "ok")
             await db.increment_sent(sender_phone)
+            logger.info("✅ Отправлено на %s", recipient_phone)
             return "ok"
 
-        except FloodWait as e:
-    wait = e.value + 3
-    if attempt < _max_retries - 1:
-        await asyncio.sleep(wait)
-        continue
-    return f"error: flood_wait {e.value}s"
+        except asyncio.TimeoutError:
+            logger.warning("Таймаут при отправке на %s", recipient_phone)
+            if attempt < _max_retries - 1:
+                await asyncio.sleep(5)
                 continue
-            # Исчерпали попытки
+            await db.log_mailing(sender_phone, recipient_phone, "error: timeout")
+            return "error: timeout"
+
+        except FloodWait as e:
+            wait = e.value + 3
+            logger.warning("FloodWait %d сек для %s (попытка %d/%d)", wait, sender_phone, attempt + 1, _max_retries)
+            if attempt < _max_retries - 1:
+                await asyncio.sleep(wait)
+                continue
             await db.log_mailing(sender_phone, recipient_phone, f"flood_wait:{e.value}")
             return f"error: flood_wait {e.value}s"
 
@@ -158,7 +161,6 @@ result = await asyncio.wait_for(
             return f"error: {err}"
 
         finally:
-            # Шаг 3: удаляем из контактов в любом случае
             if user_id is not None and user is not None:
                 try:
                     await client.invoke(
