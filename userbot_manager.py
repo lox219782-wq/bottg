@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from pyrogram import Client, raw
 from pyrogram.errors import (
     FloodWait,
@@ -6,10 +7,11 @@ from pyrogram.errors import (
     AuthKeyUnregistered,
     PhoneNumberBanned,
     PeerIdInvalid,
+    UserPrivacyRestricted,
 )
 import database as db
 
-
+logger = logging.getLogger(__name__)
 _clients: dict[str, Client] = {}
 
 
@@ -25,14 +27,13 @@ async def get_client(phone: str, api_id: int, api_hash: str) -> Client:
 
     session_string = account.get("session_string", "")
     if not session_string:
-        raise ValueError(f"Нет сохранённой сессии для аккаунта {phone}. Добавьте аккаунт заново.")
+        raise ValueError(f"Нет сохранённой сессии для {phone}. Добавьте аккаунт заново.")
 
     client = Client(
         name=phone,
         api_id=api_id,
         api_hash=api_hash,
         session_string=session_string,
-        in_memory=True,
         no_updates=True,
     )
     await client.start()
@@ -43,10 +44,12 @@ async def get_client(phone: str, api_id: int, api_hash: str) -> Client:
 async def load_all_accounts() -> None:
     """Загружает все активные аккаунты из БД при старте бота."""
     accounts = await db.get_all_accounts()
+    loaded = 0
     for account in accounts:
         phone = account["phone"]
         session_string = account.get("session_string", "")
         if not session_string:
+            logger.warning("Аккаунт %s без session_string — пропускаем", phone)
             continue
         if phone in _clients and _clients[phone].is_connected:
             continue
@@ -56,163 +59,95 @@ async def load_all_accounts() -> None:
                 api_id=account["api_id"],
                 api_hash=account["api_hash"],
                 session_string=session_string,
-                in_memory=True,
                 no_updates=True,
             )
             await client.start()
             _clients[phone] = client
-        except Exception:
-            pass
+            loaded += 1
+            logger.info("Аккаунт %s загружен", phone)
+        except Exception as e:
+            logger.warning("Не удалось загрузить аккаунт %s: %s", phone, e)
+    logger.info("Загружено аккаунтов: %d / %d", loaded, len(accounts))
 
 
-async def check_contacts(
-    phones: list[str],
-    progress_callback=None,
-) -> dict:
-    """
-    Проверяет список номеров телефонов — есть ли у них Telegram.
-    Использует import_contacts через один из активных аккаунтов.
-    """
-    accounts = await db.get_all_accounts()
-    if not accounts:
-        return {"found": [], "not_found": len(phones), "errors": 0,
-                "error": "Нет активных аккаунтов для проверки"}
-
-    account = accounts[0]
-    client = await get_client(account["phone"], account["api_id"], account["api_hash"])
-
-    found = []
-    not_found = 0
-    errors = 0
-    batch_size = 100
-
-    for i in range(0, len(phones), batch_size):
-        batch = phones[i:i + batch_size]
-
-        try:
-            result = await client.invoke(
-                raw.functions.contacts.ImportContacts(
-                    contacts=[
-                        raw.types.InputPhoneContact(
-                            client_id=j,
-                            phone=phone.strip(),
-                            first_name="x",
-                            last_name=""
-                        )
-                        for j, phone in enumerate(batch)
-                    ]
-                )
-            )
-
-            batch_found = []
-            for user in result.users:
-                phone_num = getattr(user, "phone", None)
-                if not phone_num:
-                    for imp in result.imported:
-                        if imp.user_id == user.id:
-                            phone_num = batch[imp.client_id]
-                            break
-                batch_found.append({
-                    "phone": f"+{phone_num}" if phone_num and not str(phone_num).startswith("+") else phone_num or "",
-                    "username": getattr(user, "username", None),
-                    "first_name": getattr(user, "first_name", "") or "",
-                })
-
-            found.extend(batch_found)
-            not_found += len(batch) - len(result.users)
-
-            if result.users:
-                try:
-                    await client.invoke(
-                        raw.functions.contacts.DeleteContacts(
-                            id=[raw.types.InputUser(user_id=u.id, access_hash=u.access_hash)
-                                for u in result.users]
-                        )
-                    )
-                except Exception:
-                    pass
-
-        except FloodWait as e:
-            await asyncio.sleep(e.value + 5)
-            errors += len(batch)
-        except Exception:
-            errors += len(batch)
-
-        if progress_callback:
-            done = min(i + batch_size, len(phones))
-            await progress_callback(done, len(phones), len(found))
-
-        await asyncio.sleep(2)
-
-    return {"found": found, "not_found": not_found, "errors": errors}
-
-
-async def send_message_to_contact(
+async def send_to_phone(
     client: Client,
-    phone: str,
-    contact: str,
+    sender_phone: str,
+    recipient_phone: str,
     text: str,
 ) -> str:
+    """
+    Добавляет номер как контакт → отправляет сообщение → удаляет из контактов.
+    Возвращает: 'ok', 'no_telegram', 'privacy', 'banned', 'error: ...'
+    """
+    user_id = None
     try:
-        await client.send_message(contact, text)
-        await db.log_mailing(phone, contact, "ok")
-        await db.increment_sent(phone)
+        # Шаг 1: добавляем номер в контакты
+        result = await client.invoke(
+            raw.functions.contacts.ImportContacts(
+                contacts=[
+                    raw.types.InputPhoneContact(
+                        client_id=0,
+                        phone=recipient_phone,
+                        first_name="Contact",
+                        last_name="",
+                    )
+                ]
+            )
+        )
+
+        if not result.users:
+            # Номер не в Telegram
+            return "no_telegram"
+
+        user = result.users[0]
+        user_id = user.id
+
+        # Шаг 2: отправляем сообщение
+        await client.send_message(user_id, text)
+        await db.log_mailing(sender_phone, recipient_phone, "ok")
+        await db.increment_sent(sender_phone)
         return "ok"
+
     except FloodWait as e:
-        await asyncio.sleep(e.value)
-        return await send_message_to_contact(client, phone, contact, text)
+        wait = e.value + 3
+        logger.warning("FloodWait %d сек для %s", wait, sender_phone)
+        await asyncio.sleep(wait)
+        # Повторная попытка после ожидания
+        return await send_to_phone(client, sender_phone, recipient_phone, text)
+
+    except UserPrivacyRestricted:
+        await db.log_mailing(sender_phone, recipient_phone, "privacy")
+        return "privacy"
+
     except (PeerIdInvalid, ValueError):
-        await db.log_mailing(phone, contact, "invalid")
+        await db.log_mailing(sender_phone, recipient_phone, "invalid")
         return "invalid"
+
     except (UserDeactivated, AuthKeyUnregistered, PhoneNumberBanned):
-        await db.deactivate_account(phone)
-        await db.log_mailing(phone, contact, "account_banned")
-        return "account_banned"
+        await db.deactivate_account(sender_phone)
+        await db.log_mailing(sender_phone, recipient_phone, "account_banned")
+        return "banned"
+
     except Exception as e:
-        await db.log_mailing(phone, contact, f"error: {e}")
-        return f"error: {e}"
+        err = str(e)
+        await db.log_mailing(sender_phone, recipient_phone, f"error: {err}")
+        return f"error: {err}"
 
-
-async def run_mailing(
-    text: str,
-    contacts: list[str],
-    progress_callback=None,
-) -> dict:
-    accounts = await db.get_all_accounts()
-    if not accounts:
-        return {"ok": 0, "fail": 0, "error": "Нет активных аккаунтов"}
-
-    results = {"ok": 0, "fail": 0}
-    acc_index = 0
-
-    for i, contact in enumerate(contacts):
-        contact = contact.strip()
-        if not contact:
-            continue
-
-        account = accounts[acc_index % len(accounts)]
-        acc_index += 1
-
-        try:
-            client = await get_client(
-                account["phone"], account["api_id"], account["api_hash"]
-            )
-            status = await send_message_to_contact(
-                client, account["phone"], contact, text
-            )
-            if status == "ok":
-                results["ok"] += 1
-            else:
-                results["fail"] += 1
-        except Exception:
-            results["fail"] += 1
-
-        if progress_callback and (i + 1) % 10 == 0:
-            await progress_callback(i + 1, len(contacts), results)
-
-        await asyncio.sleep(0.5)
-
-    return results
+    finally:
+        # Шаг 3: удаляем из контактов в любом случае
+        if user_id:
+            try:
+                await client.invoke(
+                    raw.functions.contacts.DeleteContacts(
+                        id=[raw.types.InputUser(
+                            user_id=user_id,
+                            access_hash=user.access_hash,
+                        )]
+                    )
+                )
+            except Exception:
+                pass
 
 
 async def disconnect_all() -> None:
