@@ -1,6 +1,6 @@
 import asyncio
 import os
-from pyrogram import Client
+from pyrogram import Client, raw
 from pyrogram.errors import (
     FloodWait,
     UserDeactivated,
@@ -48,6 +48,93 @@ async def create_temp_client(api_id: int, api_hash: str, session_name: str) -> C
         no_updates=True,
     )
     return client
+
+
+async def check_contacts(
+    phones: list[str],
+    progress_callback=None,
+) -> dict:
+    """
+    Проверяет список номеров телефонов — есть ли у них Telegram.
+    Использует import_contacts через один из активных аккаунтов.
+    Возвращает dict: found (список), not_found (кол-во), errors (кол-во).
+    """
+    accounts = await db.get_all_accounts()
+    if not accounts:
+        return {"found": [], "not_found": len(phones), "errors": 0,
+                "error": "Нет активных аккаунтов для проверки"}
+
+    account = accounts[0]
+    client = await get_client(account["phone"], account["api_id"], account["api_hash"])
+
+    found = []
+    not_found = 0
+    errors = 0
+    batch_size = 100  # Telegram позволяет до 100 контактов за раз
+
+    for i in range(0, len(phones), batch_size):
+        batch = phones[i:i + batch_size]
+
+        try:
+            # Импортируем контакты через сырой API Telegram
+            result = await client.invoke(
+                raw.functions.contacts.ImportContacts(
+                    contacts=[
+                        raw.types.InputPhoneContact(
+                            client_id=j,
+                            phone=phone.strip(),
+                            first_name="x",
+                            last_name=""
+                        )
+                        for j, phone in enumerate(batch)
+                    ]
+                )
+            )
+
+            # Собираем найденных пользователей
+            batch_found = []
+            for user in result.users:
+                phone_num = getattr(user, "phone", None)
+                if not phone_num:
+                    # Ищем совпадение по imported
+                    for imp in result.imported:
+                        if imp.user_id == user.id:
+                            phone_num = batch[imp.client_id]
+                            break
+                batch_found.append({
+                    "phone": f"+{phone_num}" if phone_num and not str(phone_num).startswith("+") else phone_num or "",
+                    "username": getattr(user, "username", None),
+                    "first_name": getattr(user, "first_name", "") or "",
+                })
+
+            found.extend(batch_found)
+            not_found += len(batch) - len(result.users)
+
+            # Удаляем импортированные контакты чтобы не засорять
+            if result.users:
+                try:
+                    await client.invoke(
+                        raw.functions.contacts.DeleteContacts(
+                            id=[raw.types.InputUser(user_id=u.id, access_hash=u.access_hash)
+                                for u in result.users]
+                        )
+                    )
+                except Exception:
+                    pass
+
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 5)
+            errors += len(batch)
+        except Exception:
+            errors += len(batch)
+
+        if progress_callback:
+            done = min(i + batch_size, len(phones))
+            await progress_callback(done, len(phones), len(found))
+
+        await asyncio.sleep(2)  # пауза между батчами
+
+    return {"found": found, "not_found": not_found, "errors": errors}
 
 
 async def send_message_to_contact(
@@ -119,7 +206,7 @@ async def run_mailing(
 
 
 async def disconnect_all() -> None:
-    for phone, client in _clients.items():
+    for phone, client in list(_clients.items()):
         try:
             if client.is_connected:
                 await client.stop()
