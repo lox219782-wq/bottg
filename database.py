@@ -6,7 +6,7 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # 1. Таблица аккаунтов-юзерботов (храним строку сессии Pyrogram)
+    # 1. Таблица аккаунтов-юзерботов
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS userbots (
             phone TEXT PRIMARY KEY,
@@ -19,24 +19,51 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS phone_checker (
             phone TEXT PRIMARY KEY,
-            has_telegram INTEGER DEFAULT 0, -- 0 - не проверен, 1 - есть ТГ, 2 - нет ТГ
+            has_telegram INTEGER DEFAULT 0,
             telegram_id INTEGER DEFAULT NULL,
             username TEXT DEFAULT NULL
         )
     """)
+
+    # 3. Новая таблица для настроек API (ID и HASH)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS api_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
+    
+    # Записываем стандартные ключи, если таблица пустая
+    cursor.execute("INSERT OR IGNORE INTO api_settings (key, value) VALUES ('api_id', '2040')")
+    cursor.execute("INSERT OR IGNORE INTO api_settings (key, value) VALUES ('api_hash', 'b18441a1ff607e10a989891a5462e627')")
     
     conn.commit()
     conn.close()
     print("[БД] База данных успешно инициализирована.")
 
-# --- Функции для работы с юзерботами ---
+# --- Функции для динамического изменения API ---
+def get_api_credentials():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT key, value FROM api_settings")
+    data = dict(cursor.fetchall())
+    conn.close()
+    # Возвращаем кортеж (api_id, api_hash)
+    return data.get('api_id', '2040'), data.get('api_hash', 'b18441a1ff607e10a989891a5462e627')
+
+def update_api_credentials(api_id: str, api_hash: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO api_settings (key, value) VALUES ('api_id', ?)", (api_id,))
+    cursor.execute("INSERT OR REPLACE INTO api_settings (key, value) VALUES ('api_hash', ?)", (api_hash,))
+    conn.commit()
+    conn.close()
+
+# --- Остальные функции (оставляем без изменений) ---
 def add_userbot(phone: str, session_string: str):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO userbots (phone, session_string, status) VALUES (?, ?, 'active')",
-        (phone, session_string)
-    )
+    cursor.execute("INSERT OR REPLACE INTO userbots (phone, session_string, status) VALUES (?, ?, 'active')", (phone, session_string))
     conn.commit()
     conn.close()
 
@@ -48,7 +75,6 @@ def get_all_userbots():
     conn.close()
     return rows
 
-# --- Функции для работы с чекером номеров ---
 def upload_phones(phone_list: list):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -68,9 +94,6 @@ def get_unverified_phones(limit=100):
 def update_phone_status(phone: str, status: int, tg_id=None, username=None):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE phone_checker SET has_telegram = ?, telegram_id = ?, username = ? WHERE phone = ?",
-        (status, tg_id, username, phone)
-    )
+    cursor.execute("UPDATE phone_checker SET has_telegram = ?, telegram_id = ?, username = ? WHERE phone = ?", (status, tg_id, username, phone))
     conn.commit()
     conn.close()
