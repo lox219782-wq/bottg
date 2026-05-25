@@ -6,7 +6,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.filters import Filter
 from pyrogram import Client
-from pyrogram.storage import StringSession
 from pyrogram.errors import SessionPasswordNeeded, PhoneCodeExpired, PhoneCodeInvalid
 import database as db
 import userbot_manager as ub_mgr
