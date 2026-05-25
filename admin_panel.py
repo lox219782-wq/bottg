@@ -12,7 +12,7 @@ import database as db
 import userbot_manager as ub_mgr
 from config import ADMIN_IDS, UPLOADS_DIR
 
-admin_router = Router()
+admin_panel = Router()
 
 BACK = "🔙 Назад"
 
