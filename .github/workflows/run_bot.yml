@@ -1,27 +1,36 @@
-name: Test Main Bot System
+name: Run Telegram Bot
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
-  run-admin-bot:
+  run-bot:
     runs-on: ubuntu-latest
+
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+      DB_PATH: bot/bot.db
+      SESSIONS_DIR: bot/sessions
+      UPLOADS_DIR: bot/uploads
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.10'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-    - name: Install dependencies
-      run: |
-        pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r bot/requirements.txt
 
-    - name: Run Main Bot
-      env:
-        BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-        ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
-      run: |
-        python main.py
+      - name: Create required directories
+        run: mkdir -p bot/sessions bot/uploads
+
+      - name: Run bot
+        working-directory: bot
+        run: python main.py
