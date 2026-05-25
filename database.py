@@ -52,11 +52,14 @@ async def save_api_settings(api_id: int, api_hash: str) -> None:
         await db.commit()
 
 
-async def get_api_settings() -> tuple[int, str] | None:
+async def get_api_settings() -> tuple[int, str]:
+    from config import DEFAULT_API_ID, DEFAULT_API_HASH
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT api_id, api_hash FROM api_settings WHERE id=1") as cursor:
             row = await cursor.fetchone()
-            return (row[0], row[1]) if row else None
+            if row:
+                return (row[0], row[1])
+    return (DEFAULT_API_ID, DEFAULT_API_HASH)
 
 
 async def add_account(phone: str, session_name: str, api_id: int, api_hash: str) -> None:
