@@ -1,11 +1,4 @@
-on:
-  push:
-    branches: [main]
-    branches:
-      - main
-  workflow_dispatch:
 jobs:
-  run-bot:
   bot:
     runs-on: ubuntu-latest
     env:
@@ -15,21 +8,16 @@ jobs:
       SESSIONS_DIR: sessions
       UPLOADS_DIR: uploads
     steps:
-      - name: Checkout code
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Set up Python
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
--2
-+2
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Create required directories
-      - name: Create directories
+-0
++6
         run: mkdir -p sessions uploads
-      - name: Run bot
       - name: Start bot
+        env:
+          BOT_TOKEN: "${{ secrets.BOT_TOKEN }}"
+          ADMIN_IDS: "${{ secrets.ADMIN_IDS }}"
+          DB_PATH: "bot.db"
+          SESSIONS_DIR: "sessions"
+          UPLOADS_DIR: "uploads"
         run: python main.py
