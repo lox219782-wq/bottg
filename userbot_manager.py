@@ -1,5 +1,4 @@
 import asyncio
-import os
 from pyrogram import Client, raw
 from pyrogram.errors import (
     FloodWait,
@@ -9,17 +8,13 @@ from pyrogram.errors import (
     PeerIdInvalid,
 )
 import database as db
-from config import SESSIONS_DIR
 
 
 _clients: dict[str, Client] = {}
 
 
-def _session_path(session_name: str) -> str:
-    return os.path.join(SESSIONS_DIR, session_name)
-
-
 async def get_client(phone: str, api_id: int, api_hash: str) -> Client:
+    """Возвращает активный клиент. Если нет — создаёт из session_string в БД."""
     if phone in _clients and _clients[phone].is_connected:
         return _clients[phone]
 
@@ -28,11 +23,16 @@ async def get_client(phone: str, api_id: int, api_hash: str) -> Client:
     if not account:
         raise ValueError(f"Аккаунт {phone} не найден в БД")
 
-    session_name = account["session_name"]
+    session_string = account.get("session_string", "")
+    if not session_string:
+        raise ValueError(f"Нет сохранённой сессии для аккаунта {phone}. Добавьте аккаунт заново.")
+
     client = Client(
-        name=_session_path(session_name),
+        name=phone,
         api_id=api_id,
         api_hash=api_hash,
+        session_string=session_string,
+        in_memory=True,
         no_updates=True,
     )
     await client.start()
@@ -40,14 +40,29 @@ async def get_client(phone: str, api_id: int, api_hash: str) -> Client:
     return client
 
 
-async def create_temp_client(api_id: int, api_hash: str, session_name: str) -> Client:
-    client = Client(
-        name=_session_path(session_name),
-        api_id=api_id,
-        api_hash=api_hash,
-        no_updates=True,
-    )
-    return client
+async def load_all_accounts() -> None:
+    """Загружает все активные аккаунты из БД при старте бота."""
+    accounts = await db.get_all_accounts()
+    for account in accounts:
+        phone = account["phone"]
+        session_string = account.get("session_string", "")
+        if not session_string:
+            continue
+        if phone in _clients and _clients[phone].is_connected:
+            continue
+        try:
+            client = Client(
+                name=phone,
+                api_id=account["api_id"],
+                api_hash=account["api_hash"],
+                session_string=session_string,
+                in_memory=True,
+                no_updates=True,
+            )
+            await client.start()
+            _clients[phone] = client
+        except Exception:
+            pass
 
 
 async def check_contacts(
@@ -57,7 +72,6 @@ async def check_contacts(
     """
     Проверяет список номеров телефонов — есть ли у них Telegram.
     Использует import_contacts через один из активных аккаунтов.
-    Возвращает dict: found (список), not_found (кол-во), errors (кол-во).
     """
     accounts = await db.get_all_accounts()
     if not accounts:
@@ -70,13 +84,12 @@ async def check_contacts(
     found = []
     not_found = 0
     errors = 0
-    batch_size = 100  # Telegram позволяет до 100 контактов за раз
+    batch_size = 100
 
     for i in range(0, len(phones), batch_size):
         batch = phones[i:i + batch_size]
 
         try:
-            # Импортируем контакты через сырой API Telegram
             result = await client.invoke(
                 raw.functions.contacts.ImportContacts(
                     contacts=[
@@ -91,12 +104,10 @@ async def check_contacts(
                 )
             )
 
-            # Собираем найденных пользователей
             batch_found = []
             for user in result.users:
                 phone_num = getattr(user, "phone", None)
                 if not phone_num:
-                    # Ищем совпадение по imported
                     for imp in result.imported:
                         if imp.user_id == user.id:
                             phone_num = batch[imp.client_id]
@@ -110,7 +121,6 @@ async def check_contacts(
             found.extend(batch_found)
             not_found += len(batch) - len(result.users)
 
-            # Удаляем импортированные контакты чтобы не засорять
             if result.users:
                 try:
                     await client.invoke(
@@ -132,7 +142,7 @@ async def check_contacts(
             done = min(i + batch_size, len(phones))
             await progress_callback(done, len(phones), len(found))
 
-        await asyncio.sleep(2)  # пауза между батчами
+        await asyncio.sleep(2)
 
     return {"found": found, "not_found": not_found, "errors": errors}
 
