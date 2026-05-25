@@ -13,6 +13,7 @@ import userbot_manager as ub_mgr
 
 admin_router = Router()
 
+# Состояния FSM
 class AddAccountState(StatesGroup):
     waiting_for_phone = State()
     waiting_for_code = State()
@@ -24,14 +25,17 @@ class MailingState(StatesGroup):
     setting_interval = State()
     waiting_for_file = State()
 
+class CheckPhonesState(StatesGroup):
+    waiting_for_file = State()
+
 class ChangeApiState(StatesGroup):
     waiting_for_api_id = State()
     waiting_for_api_hash = State()
 
+# Клавиатура
 def get_main_keyboard():
     kb = [
-        [KeyboardButton(text="📱 Добавить аккаунт (Юзербот)")],
-        [KeyboardButton(text="🚀 Запустить рассылку")],
+        [KeyboardButton(text="📱 Добавить аккаунт (Юзербот)"), KeyboardButton(text="🚀 Запустить рассылку")],
         [KeyboardButton(text="📊 Статистика системы"), KeyboardButton(text="⚙️ Настройки API")],
         [KeyboardButton(text="🔍 Проверить базу номеров")]
     ]
@@ -43,18 +47,40 @@ def is_admin(user_id: int) -> bool:
 @admin_router.message(CommandStart())
 async def cmd_start(message: Message):
     if not is_admin(message.from_user.id): return
-    await message.answer("👋 Панель управления активна.", reply_markup=get_main_keyboard())
+    await message.answer("👋 Добро пожаловать в панель управления!", reply_markup=get_main_keyboard())
 
-# --- БЛОК РАССЫЛКИ ---
+# --- СТАТИСТИКА ---
+@admin_router.message(F.text == "📊 Статистика системы")
+async def show_stats(message: Message):
+    if not is_admin(message.from_user.id): return
+    userbots = db.get_all_userbots()
+    
+    conn = db.sqlite3.connect(db.DB_PATH)
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT COUNT(*), SUM(has_telegram=1), SUM(has_telegram=2) FROM phone_checker")
+        data = cursor.fetchone()
+        total, with_tg, no_tg = (data[0] or 0, data[1] or 0, data[2] or 0)
+    except:
+        total, with_tg, no_tg = 0, 0, 0
+    conn.close()
+    
+    await message.answer(
+        f"📊 **Статистика:**\n"
+        f"🤖 Активных аккаунтов: {len(userbots)}\n"
+        f"📞 Всего номеров: {total}\n"
+        f"✅ С ТГ: {with_tg} | ❌ Без ТГ: {no_tg}"
+    )
+
+# --- РАССЫЛКА ---
 @admin_router.message(F.text == "🚀 Запустить рассылку")
 async def start_mailing_flow(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id): return
     bots = db.get_all_userbots()
     if not bots:
         await message.answer("❌ Сначала добавьте аккаунты!")
         return
     kb = [[KeyboardButton(text=b[0])] for b in bots]
-    await message.answer("Выберите аккаунт для отправки:", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
+    await message.answer("Выберите аккаунт для рассылки:", reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True))
     await state.set_state(MailingState.choosing_bot)
 
 @admin_router.message(MailingState.choosing_bot)
@@ -66,16 +92,13 @@ async def choose_bot(message: Message, state: FSMContext):
 @admin_router.message(MailingState.writing_text)
 async def set_text(message: Message, state: FSMContext):
     await state.update_data(text=message.text)
-    await message.answer("Введите интервал между сообщениями (секунды):")
+    await message.answer("Введите интервал между сообщениями (сек):")
     await state.set_state(MailingState.setting_interval)
 
 @admin_router.message(MailingState.setting_interval)
 async def set_interval(message: Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("Введите число!")
-        return
     await state.update_data(interval=int(message.text))
-    await message.answer("Отправьте .txt файл с номерами (один номер на строку):")
+    await message.answer("Отправьте .txt файл с номерами:")
     await state.set_state(MailingState.waiting_for_file)
 
 @admin_router.message(MailingState.waiting_for_file, F.document)
@@ -88,10 +111,9 @@ async def finish_mailing(message: Message, state: FSMContext):
     bots = dict(db.get_all_userbots())
     session = bots[data['phone']]
     
-    await message.answer("✅ Рассылка запущена в фоне!", reply_markup=get_main_keyboard())
+    await message.answer("✅ Рассылка запущена!")
     asyncio.create_task(ub_mgr.start_mailing(data['phone'], session, data['text'], numbers, data['interval']))
     await state.clear()
 
-# --- ОСТАЛЬНАЯ ЛОГИКА (API, Добавление аккаунта и т.д.) ---
-# Оставь здесь старые функции: show_api_settings, process_new_api_id, start_add_account, process_phone, process_code, process_2fa, start_check_phones, process_phones_file
-# Они без изменений, просто добавь их после блока рассылки.
+# --- API И АККАУНТЫ (Оставь старую логику тут) ---
+# [Вставь сюда функции: show_api_settings, process_new_api_id, process_new_api_hash, start_add_account, process_phone, process_code, process_2fa, start_check_phones, process_phones_file из твоего предыдущего файла]
