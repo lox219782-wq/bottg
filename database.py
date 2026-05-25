@@ -37,6 +37,15 @@ async def init_db() -> None:
                 sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT UNIQUE NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
 
@@ -53,8 +62,8 @@ async def save_api_settings(api_id: int, api_hash: str) -> None:
 
 
 async def get_api_settings() -> tuple[int, str]:
-    _default_api_id = 2040
-    _default_api_hash = "b18441a1ff607e10a989891a5462e627"
+    _default_api_id = 0
+    _default_api_hash = ""
     try:
         from config import DEFAULT_API_ID, DEFAULT_API_HASH
         _default_api_id = DEFAULT_API_ID
@@ -104,6 +113,46 @@ async def log_mailing(phone: str, recipient: str, status: str) -> None:
         await db.commit()
 
 
+async def save_contacts(contacts: list[dict]) -> int:
+    """Сохраняет найденные контакты (у которых есть Telegram). Возвращает кол-во новых."""
+    new_count = 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        for c in contacts:
+            cursor = await db.execute(
+                "INSERT OR IGNORE INTO contacts (phone, username, first_name) VALUES (?, ?, ?)",
+                (c["phone"], c.get("username"), c.get("first_name"))
+            )
+            if cursor.rowcount:
+                new_count += 1
+        await db.commit()
+    return new_count
+
+
+async def get_contacts(limit: int = 0) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        query = "SELECT * FROM contacts ORDER BY added_at DESC"
+        if limit:
+            query += f" LIMIT {limit}"
+        async with db.execute(query) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def get_contacts_count() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM contacts") as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+
+async def clear_contacts() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("DELETE FROM contacts")
+        await db.commit()
+        return cursor.rowcount
+
+
 async def get_stats() -> dict:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT COUNT(*), SUM(sent_count) FROM accounts WHERE active=1") as c:
@@ -118,11 +167,15 @@ async def get_stats() -> dict:
         ) as c:
             row = await c.fetchone()
             sent_today = row[0] or 0
+        async with db.execute("SELECT COUNT(*) FROM contacts") as c:
+            row = await c.fetchone()
+            contacts_count = row[0] or 0
     return {
         "active": active,
         "inactive": inactive,
         "total_sent": total_sent,
         "sent_today": sent_today,
+        "contacts": contacts_count,
     }
 
 
