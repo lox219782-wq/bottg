@@ -105,14 +105,6 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @admin_router.message(F.text == "📱 Добавить аккаунт (UserBot)")
 async def add_acc_start(message: Message, state: FSMContext) -> None:
-    settings = await db.get_api_settings()
-    if not settings:
-        await message.answer(
-            "⚠️ Сначала настройте API через кнопку <b>⚙️ Настройка API</b>\n"
-            "Вам нужны API_ID и API_HASH с сайта my.telegram.org",
-            parse_mode="HTML",
-        )
-        return
     await message.answer(
         "📱 <b>Добавление аккаунта</b>\n\n"
         "Введите номер телефона в формате <code>+79001234567</code>:",
@@ -133,13 +125,7 @@ async def add_acc_phone(message: Message, state: FSMContext) -> None:
         )
         return
 
-    settings = await db.get_api_settings()
-    if not settings:
-        await message.answer("⚠️ API не настроен.", reply_markup=get_main_keyboard())
-        await state.clear()
-        return
-
-    api_id, api_hash = settings
+    api_id, api_hash = await db.get_api_settings()
     session_name = f"acc_{phone.replace('+', '')}"
     os.makedirs(SESSIONS_DIR, exist_ok=True)
 
@@ -379,3 +365,171 @@ async def mailing_file_wrong(message: Message) -> None:
 
 
 # ──────────────────────────────────────────────────────────────
+# 3. СТАТИСТИКА
+# ──────────────────────────────────────────────────────────────
+
+@admin_router.message(F.text == "📊 Статистика")
+async def show_stats(message: Message) -> None:
+    stats = await db.get_stats()
+    accounts = await db.get_all_accounts()
+
+    lines = [
+        "📊 <b>Статистика рассылки</b>\n",
+        f"🟢 Активных аккаунтов: <b>{stats['active']}</b>",
+        f"🔴 Отключённых аккаунтов: <b>{stats['inactive']}</b>",
+        f"📤 Всего отправлено сообщений: <b>{stats['total_sent']}</b>",
+        f"📅 Отправлено сегодня: <b>{stats['sent_today']}</b>",
+    ]
+
+    if accounts:
+        lines.append("\n<b>Аккаунты:</b>")
+        for acc in accounts:
+            status = "🟢" if acc["active"] else "🔴"
+            lines.append(f"  {status} <code>{acc['phone']}</code> — отправлено: {acc['sent_count']}")
+    else:
+        lines.append("\n<i>Аккаунты не добавлены</i>")
+
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=get_main_keyboard())
+
+
+# ──────────────────────────────────────────────────────────────
+# 4. НАСТРОЙКА API
+# ──────────────────────────────────────────────────────────────
+
+@admin_router.message(F.text == "⚙️ Настройка API")
+async def api_settings_start(message: Message, state: FSMContext) -> None:
+    current = await db.get_api_settings()
+    status = (
+        f"\n\n<i>Текущий API_ID: <code>{current[0]}</code></i>" if current
+        else "\n\n<i>API ещё не настроен</i>"
+    )
+    await message.answer(
+        f"⚙️ <b>Настройка API Telegram</b>{status}\n\n"
+        f"Шаг 1/2: Введите <b>API_ID</b>\n"
+        f"Получить на сайте: my.telegram.org → App configuration",
+        parse_mode="HTML",
+        reply_markup=get_back_keyboard(),
+    )
+    await state.set_state(MainStates.waiting_for_api_id)
+
+
+@admin_router.message(MainStates.waiting_for_api_id)
+async def get_api_id(message: Message, state: FSMContext) -> None:
+    text = message.text.strip() if message.text else ""
+    if not text.isdigit():
+        await message.answer(
+            "❌ API_ID — это число (например: <code>1234567</code>).\nПопробуйте ещё раз:",
+            parse_mode="HTML",
+            reply_markup=get_back_keyboard(),
+        )
+        return
+    await state.update_data(api_id=int(text))
+    await message.answer(
+        f"✅ API_ID сохранён: <code>{text}</code>\n\n"
+        f"Шаг 2/2: Введите <b>API_HASH</b>\n"
+        f"(строка вида: <code>abc123def456...</code>)",
+        parse_mode="HTML",
+        reply_markup=get_back_keyboard(),
+    )
+    await state.set_state(MainStates.waiting_for_api_hash)
+
+
+@admin_router.message(MainStates.waiting_for_api_hash)
+async def get_api_hash(message: Message, state: FSMContext) -> None:
+    api_hash = message.text.strip() if message.text else ""
+    if len(api_hash) < 10:
+        await message.answer(
+            "❌ API_HASH слишком короткий. Скопируйте его с my.telegram.org:",
+            reply_markup=get_back_keyboard(),
+        )
+        return
+    data = await state.get_data()
+    api_id: int = data["api_id"]
+    await db.save_api_settings(api_id, api_hash)
+    await state.clear()
+    await message.answer(
+        f"✅ <b>API успешно настроен!</b>\n\n"
+        f"API_ID: <code>{api_id}</code>\n"
+        f"API_HASH: <code>{api_hash}</code>\n\n"
+        f"Теперь можно добавлять аккаунты.",
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+# ──────────────────────────────────────────────────────────────
+# 5. ПРОВЕРИТЬ БАЗУ
+# ──────────────────────────────────────────────────────────────
+
+@admin_router.message(F.text == "🔍 Проверить базу")
+async def check_base_start(message: Message, state: FSMContext) -> None:
+    await message.answer(
+        "🔍 <b>Проверка базы номеров</b>\n\n"
+        "Отправьте <b>.txt файл</b> со списком номеров телефонов\n"
+        "(один номер на строку).\n\n"
+        "Бот покажет, какие из них уже есть в активных аккаунтах:",
+        parse_mode="HTML",
+        reply_markup=get_back_keyboard(),
+    )
+    await state.set_state(MainStates.waiting_for_check_file)
+
+
+@admin_router.message(MainStates.waiting_for_check_file, F.document)
+async def check_base_file(message: Message, state: FSMContext) -> None:
+    doc: Document = message.document
+    if not doc.file_name.endswith(".txt"):
+        await message.answer(
+            "❌ Нужен файл в формате <b>.txt</b>. Попробуйте ещё раз:",
+            parse_mode="HTML",
+            reply_markup=get_back_keyboard(),
+        )
+        return
+
+    os.makedirs(UPLOADS_DIR, exist_ok=True)
+    file_path = os.path.join(UPLOADS_DIR, f"check_{doc.file_name}")
+    await message.bot.download(doc, destination=file_path)
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        numbers = [line.strip() for line in f if line.strip()]
+
+    await state.clear()
+
+    if not numbers:
+        await message.answer("❌ Файл пустой.", reply_markup=get_main_keyboard())
+        return
+
+    accounts = await db.get_all_accounts()
+    active_phones = {a["phone"] for a in accounts}
+
+    found = [n for n in numbers if n in active_phones]
+    not_found = [n for n in numbers if n not in active_phones]
+
+    lines = [
+        "🔍 <b>Результат проверки базы</b>\n",
+        f"📋 Всего номеров в файле: <b>{len(numbers)}</b>",
+        f"✅ Совпадений с активными аккаунтами: <b>{len(found)}</b>",
+        f"❌ Не найдено: <b>{len(not_found)}</b>",
+    ]
+
+    if found:
+        lines.append("\n<b>Найденные номера:</b>")
+        for n in found[:20]:
+            lines.append(f"  ✅ <code>{n}</code>")
+        if len(found) > 20:
+            lines.append(f"  <i>... и ещё {len(found) - 20}</i>")
+
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+@admin_router.message(MainStates.waiting_for_check_file)
+async def check_base_wrong(message: Message) -> None:
+    await message.answer(
+        "❌ Ожидается <b>.txt файл</b> — нажмите скрепку и выберите файл.\n"
+        "Или нажмите 🔙 Назад для отмены.",
+        parse_mode="HTML",
+        reply_markup=get_back_keyboard(),
+    )
