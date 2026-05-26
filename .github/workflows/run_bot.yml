@@ -4,10 +4,13 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'   # перезапуск каждые 5 часов
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
 
     steps:
       - name: Checkout
@@ -24,9 +27,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Restore DB and sessions
+        env:
+          DB_B64: ${{ secrets.DB_B64 }}
+          SESSIONS_B64: ${{ secrets.SESSIONS_B64 }}
+        run: |
+          if [ -n "$DB_B64" ]; then
+            echo "$DB_B64" | base64 -d > bot.db
+            echo "✅ База данных восстановлена"
+          fi
+          if [ -n "$SESSIONS_B64" ]; then
+            mkdir -p sessions
+            echo "$SESSIONS_B64" | base64 -d | tar -xz -C sessions/
+            echo "✅ Сессии восстановлены"
+          fi
+
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
+          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
         run: python main.py
