@@ -1,4 +1,4 @@
-import asyncio
+Лimport asyncio
 import inspect
 import logging
 import os
@@ -24,7 +24,13 @@ _mailing_task: asyncio.Task | None = None
 
 class IsAdmin(Filter):
     async def __call__(self, message: Message) -> bool:
-        return message.from_user is not None and message.from_user.id in ADMIN_IDS
+        if message.from_user is None:
+            return False
+        # Проверяем по БД (с фолбэком на config.py при ошибке)
+        try:
+            return await db.is_admin(message.from_user.id)
+        except Exception:
+            return message.from_user.id in ADMIN_IDS
 
 
 admin_router.message.filter(IsAdmin())
@@ -39,6 +45,8 @@ class States(StatesGroup):
     waiting_for_mailing_file = State()
     waiting_for_mailing_text = State()
     waiting_for_mailing_interval = State()
+    waiting_for_new_admin_id = State()
+    waiting_for_remove_admin_id = State()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -51,6 +59,7 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="👥 Аккаунты"), KeyboardButton(text="📱 Добавить аккаунт")],
             [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Настройка API")],
             [KeyboardButton(text="🚀 Запустить рассылку")],
+            [KeyboardButton(text="🔑 Администраторы")],
         ],
         resize_keyboard=True,
     )
@@ -66,6 +75,16 @@ def get_back_keyboard() -> ReplyKeyboardMarkup:
 def get_stop_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text=STOP_BTN)]],
+        resize_keyboard=True,
+    )
+
+
+def get_admins_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="➕ Добавить админа"), KeyboardButton(text="➖ Удалить админа")],
+            [KeyboardButton(text=BACK)],
+        ],
         resize_keyboard=True,
     )
 
@@ -410,7 +429,7 @@ async def mailing_got_interval(message: Message, state: FSMContext) -> None:
     await state.clear()
 
     accounts = await db.get_all_accounts()
-    active_accounts = accounts[:10]  # максимум 10 аккаунтов одновременно
+    active_accounts = accounts[:10]
     n_acc = len(active_accounts)
 
     status_msg = await message.answer(
@@ -502,12 +521,9 @@ async def _run_mailing(
                 if counters["done"] % 5 == 0 or counters["done"] == total:
                     asyncio.create_task(update_status())
 
-            # Пауза между сообщениями этого аккаунта (кроме последнего)
             if i < len(my_numbers) - 1:
                 await asyncio.sleep(interval)
 
-    # Делим номера между аккаунтами по очереди:
-    # 3 аккаунта, 9 номеров → acc0:[0,3,6], acc1:[1,4,7], acc2:[2,5,8]
     worker_coros = []
     for idx, account in enumerate(accounts):
         my_slice = numbers[idx::n_acc]
@@ -646,3 +662,138 @@ async def get_api_hash(message: Message, state: FSMContext) -> None:
         f"Теперь добавьте аккаунт через <b>📱 Добавить аккаунт</b>.",
         parse_mode="HTML", reply_markup=get_main_keyboard(),
     )
+
+
+# ──────────────────────────────────────────────────────────────
+# 6. АДМИНИСТРАТОРЫ
+# ──────────────────────────────────────────────────────────────
+
+@admin_router.message(F.text == "🔑 Администраторы")
+async def show_admins(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    admins = await db.get_admins()
+    lines = [f"🔑 <b>Администраторы ({len(admins)})</b>\n"]
+    for uid in admins:
+        lines.append(f"  • <code>{uid}</code>")
+    lines.append(
+        "\n<i>Ваш ID: <code>{}</code></i>".format(message.from_user.id)
+    )
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=get_admins_keyboard(),
+    )
+
+
+@admin_router.message(F.text == "➕ Добавить админа")
+async def add_admin_start(message: Message, state: FSMContext) -> None:
+    await message.answer(
+        "➕ <b>Добавить администратора</b>\n\n"
+        "Введите Telegram ID пользователя.\n"
+        "Чтобы узнать свой ID — перешлите сообщение боту @userinfobot",
+        parse_mode="HTML",
+        reply_markup=get_back_keyboard(),
+    )
+    await state.set_state(States.waiting_for_new_admin_id)
+
+
+@admin_router.message(States.waiting_for_new_admin_id)
+async def add_admin_id(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if not text.lstrip("-").isdigit():
+        await message.answer(
+            "❌ ID должен быть числом. Попробуйте ещё раз:",
+            reply_markup=get_back_keyboard(),
+        )
+        return
+
+    user_id = int(text)
+    if user_id == message.from_user.id:
+        await message.answer(
+            "❌ Нельзя добавить самого себя — вы уже администратор.",
+            reply_markup=get_admins_keyboard(),
+        )
+        await state.clear()
+        return
+
+    added = await db.add_admin(user_id)
+    if added:
+        await message.answer(
+            f"✅ Администратор <code>{user_id}</code> добавлен.",
+            parse_mode="HTML",
+            reply_markup=get_admins_keyboard(),
+        )
+    else:
+        await message.answer(
+            f"ℹ️ Пользователь <code>{user_id}</code> уже является администратором.",
+            parse_mode="HTML",
+            reply_markup=get_admins_keyboard(),
+        )
+    await state.clear()
+
+
+@admin_router.message(F.text == "➖ Удалить админа")
+async def remove_admin_start(message: Message, state: FSMContext) -> None:
+    admins = await db.get_admins()
+    if len(admins) <= 1:
+        await message.answer(
+            "❌ Нельзя удалить последнего администратора.",
+            reply_markup=get_admins_keyboard(),
+        )
+        return
+    lines = ["➖ <b>Удалить администратора</b>\n", "Текущие администраторы:"]
+    for uid in admins:
+        marker = " (вы)" if uid == message.from_user.id else ""
+        lines.append(f"  • <code>{uid}</code>{marker}")
+    lines.append("\nВведите ID администратора которого хотите удалить:")
+    await message.answer(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=get_back_keyboard(),
+    )
+    await state.set_state(States.waiting_for_remove_admin_id)
+
+
+@admin_router.message(States.waiting_for_remove_admin_id)
+async def remove_admin_id(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    if not text.lstrip("-").isdigit():
+        await message.answer(
+            "❌ ID должен быть числом. Попробуйте ещё раз:",
+            reply_markup=get_back_keyboard(),
+        )
+        return
+
+    user_id = int(text)
+
+    if user_id == message.from_user.id:
+        await message.answer(
+            "❌ Нельзя удалить самого себя из администраторов.",
+            reply_markup=get_admins_keyboard(),
+        )
+        await state.clear()
+        return
+
+    admins = await db.get_admins()
+    if len(admins) <= 1:
+        await message.answer(
+            "❌ Нельзя удалить последнего администратора.",
+            reply_markup=get_admins_keyboard(),
+        )
+        await state.clear()
+        return
+
+    removed = await db.remove_admin(user_id)
+    if removed:
+        await message.answer(
+            f"✅ Администратор <code>{user_id}</code> удалён.",
+            parse_mode="HTML",
+            reply_markup=get_admins_keyboard(),
+        )
+    else:
+        await message.answer(
+            f"❌ Администратор <code>{user_id}</code> не найден.",
+            parse_mode="HTML",
+            reply_markup=get_admins_keyboard(),
+        )
+    await state.clear()
