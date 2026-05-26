@@ -690,10 +690,6 @@ async def _run_mailing(
             pass
 
     async def worker(account: dict, my_numbers: list[str], start_tpl_idx: int) -> None:
-        """
-        start_tpl_idx — с какого шаблона начинать этот воркер,
-        чтобы аккаунты не дублировали друг друга по шаблонам.
-        """
         phone = account["phone"]
         try:
             client = await ub_mgr.get_client(phone, account["api_id"], account["api_hash"])
@@ -704,9 +700,16 @@ async def _run_mailing(
                 counters["done"] += len(my_numbers)
             return
 
+        last_tpl_idx: int | None = None
+
         for i, recipient in enumerate(my_numbers):
-            # Ротация шаблонов: каждое следующее сообщение — следующий шаблон
-            tpl_idx = (start_tpl_idx + i) % n_tpl
+            # Случайный шаблон, но не тот же что предыдущий
+            if n_tpl == 1:
+                tpl_idx = 0
+            else:
+                available = [j for j in range(n_tpl) if j != last_tpl_idx]
+                tpl_idx = random.choice(available)
+            last_tpl_idx = tpl_idx
             text = templates[tpl_idx]
 
             try:
