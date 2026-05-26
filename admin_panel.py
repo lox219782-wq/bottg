@@ -700,16 +700,28 @@ async def _run_mailing(
                 counters["done"] += len(my_numbers)
             return
 
-        last_tpl_idx: int | None = None
+        # Строим бесконечную очередь шаблонов:
+        # перемешиваем все индексы, проходим цикл, перемешиваем снова —
+        # при этом следим чтобы первый следующего цикла ≠ последнему текущего.
+        def _make_cycle(last_idx: int | None) -> list[int]:
+            idxs = list(range(n_tpl))
+            random.shuffle(idxs)
+            # Если совпал с хвостом предыдущего цикла — свапаем с другим
+            if last_idx is not None and n_tpl > 1 and idxs[0] == last_idx:
+                swap_pos = random.randint(1, n_tpl - 1)
+                idxs[0], idxs[swap_pos] = idxs[swap_pos], idxs[0]
+            return idxs
+
+        tpl_queue: list[int] = _make_cycle(None)
+        tpl_pos = 0
 
         for i, recipient in enumerate(my_numbers):
-            # Случайный шаблон, но не тот же что предыдущий
-            if n_tpl == 1:
-                tpl_idx = 0
-            else:
-                available = [j for j in range(n_tpl) if j != last_tpl_idx]
-                tpl_idx = random.choice(available)
-            last_tpl_idx = tpl_idx
+            if tpl_pos >= len(tpl_queue):
+                # Цикл закончился — перемешиваем снова
+                tpl_queue = _make_cycle(tpl_queue[-1])
+                tpl_pos = 0
+            tpl_idx = tpl_queue[tpl_pos]
+            tpl_pos += 1
             text = templates[tpl_idx]
 
             try:
