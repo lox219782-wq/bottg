@@ -19,8 +19,10 @@ admin_router = Router()
 
 BACK = "🔙 Назад"
 STOP_BTN = "🛑 Остановить рассылку"
+MENU_BTN = "🏠 Главное меню"
 
-_mailing_task: asyncio.Task | None = None
+# phone → Task: несколько рассылок могут работать одновременно
+_mailing_tasks: dict[str, asyncio.Task] = {}
 
 
 class IsAdmin(Filter):
@@ -45,8 +47,12 @@ class States(StatesGroup):
     waiting_for_api_id = State()
     waiting_for_api_hash = State()
     # Рассылка
+    waiting_for_mailing_account = State()
+    waiting_for_mailing_templates = State()
     waiting_for_mailing_file = State()
     waiting_for_mailing_interval = State()
+    # Остановка
+    waiting_for_stop_account = State()
     # Шаблоны
     waiting_for_template_add = State()
     waiting_for_template_edit_num = State()
@@ -80,9 +86,13 @@ def get_back_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def get_stop_keyboard() -> ReplyKeyboardMarkup:
+def get_mailing_active_keyboard() -> ReplyKeyboardMarkup:
+    """Клавиатура во время активной рассылки: можно вернуться в меню не прерывая её."""
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=STOP_BTN)]],
+        keyboard=[
+            [KeyboardButton(text=MENU_BTN)],
+            [KeyboardButton(text=STOP_BTN)],
+        ],
         resize_keyboard=True,
     )
 
@@ -106,6 +116,25 @@ def get_admins_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
     )
+
+
+# ──────────────────────────────────────────────────────────────
+# ВЕРНУТЬСЯ В МЕНЮ (не останавливает рассылку)
+# ──────────────────────────────────────────────────────────────
+
+@admin_router.message(F.text == MENU_BTN)
+async def go_to_menu(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    running = [p for p, t in _mailing_tasks.items() if not t.done()]
+    if running:
+        accounts_str = ", ".join(f"<code>{p[-7:]}</code>" for p in running)
+        await message.answer(
+            f"🏠 Главное меню\n\n🔄 Рассылка продолжается: {accounts_str}",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
+        )
+    else:
+        await message.answer("🏠 Главное меню", reply_markup=get_main_keyboard())
 
 
 # ──────────────────────────────────────────────────────────────
@@ -152,17 +181,20 @@ async def show_accounts(message: Message) -> None:
     accounts = await db.get_all_accounts()
     if not accounts:
         await message.answer(
-            "👥 <b>Аккаунты</b>\n\n❌ Нет добавленных аккаунтов.\n\nНажмите <b>📱 Добавить аккаунт</b>.",
+            "👥 <b>Аккаунты</b>\n\n❌ Нет добавленных аккаунтов.",
             parse_mode="HTML", reply_markup=get_main_keyboard(),
         )
         return
     lines = [f"👥 <b>Аккаунты ({len(accounts)})</b>\n"]
     for acc in accounts:
-        status = "🟢" if acc.get("active", 1) else "🔴"
+        phone = acc["phone"]
+        is_running = phone in _mailing_tasks and not _mailing_tasks[phone].done()
+        status = "🔄" if is_running else ("🟢" if acc.get("active", 1) else "🔴")
         lines.append(
-            f"{status} <code>{acc['phone']}</code>\n"
+            f"{status} <code>{phone}</code>\n"
             f"   📤 Отправлено: {acc['sent_count']}\n"
             f"   📅 Добавлен: {str(acc.get('added_at', ''))[:10]}"
+            + (" (рассылка активна)" if is_running else "")
         )
     await message.answer("\n\n".join(lines), parse_mode="HTML", reply_markup=get_main_keyboard())
 
@@ -398,8 +430,7 @@ async def add_template_text(message: Message, state: FSMContext) -> None:
     templates = await db.get_templates()
     await state.clear()
     await message.answer(
-        f"✅ Шаблон добавлен! Всего шаблонов: <b>{len(templates)}</b>\n\n"
-        + _format_templates(templates),
+        f"✅ Шаблон добавлен! Всего: <b>{len(templates)}</b>\n\n" + _format_templates(templates),
         parse_mode="HTML",
         reply_markup=get_templates_keyboard(),
     )
@@ -412,7 +443,7 @@ async def edit_template_start(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Нет шаблонов для изменения.", reply_markup=get_templates_keyboard())
         return
     await message.answer(
-        _format_templates(templates) + "\n\nВведите <b>номер</b> шаблона который хотите изменить:",
+        _format_templates(templates) + "\n\nВведите <b>номер</b> шаблона для изменения:",
         parse_mode="HTML",
         reply_markup=get_back_keyboard(),
     )
@@ -424,17 +455,13 @@ async def edit_template_num(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     templates = await db.get_templates()
     if not text.isdigit() or not (1 <= int(text) <= len(templates)):
-        await message.answer(
-            f"❌ Введите номер от 1 до {len(templates)}:",
-            reply_markup=get_back_keyboard(),
-        )
+        await message.answer(f"❌ Введите номер от 1 до {len(templates)}:", reply_markup=get_back_keyboard())
         return
     idx = int(text) - 1
     chosen = templates[idx]
     await state.update_data(edit_template_id=chosen["id"], edit_template_num=int(text))
     await message.answer(
-        f"✏️ <b>Шаблон #{text}</b>\n\n<i>Текущий текст:</i>\n{chosen['text']}\n\n"
-        f"Введите новый текст:",
+        f"✏️ <b>Шаблон #{text}</b>\n\n<i>Текущий текст:</i>\n{chosen['text']}\n\nВведите новый текст:",
         parse_mode="HTML",
         reply_markup=get_back_keyboard(),
     )
@@ -447,13 +474,11 @@ async def edit_template_text(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Введите текстовое сообщение:", reply_markup=get_back_keyboard())
         return
     data = await state.get_data()
-    template_id: int = data["edit_template_id"]
-    num: int = data["edit_template_num"]
-    await db.update_template(template_id, message.text)
+    await db.update_template(data["edit_template_id"], message.text)
     await state.clear()
     templates = await db.get_templates()
     await message.answer(
-        f"✅ Шаблон #{num} обновлён!\n\n" + _format_templates(templates),
+        f"✅ Шаблон #{data['edit_template_num']} обновлён!\n\n" + _format_templates(templates),
         parse_mode="HTML",
         reply_markup=get_templates_keyboard(),
     )
@@ -478,14 +503,10 @@ async def delete_template_num(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     templates = await db.get_templates()
     if not text.isdigit() or not (1 <= int(text) <= len(templates)):
-        await message.answer(
-            f"❌ Введите номер от 1 до {len(templates)}:",
-            reply_markup=get_back_keyboard(),
-        )
+        await message.answer(f"❌ Введите номер от 1 до {len(templates)}:", reply_markup=get_back_keyboard())
         return
     idx = int(text) - 1
-    chosen = templates[idx]
-    await db.delete_template(chosen["id"])
+    await db.delete_template(templates[idx]["id"])
     await state.clear()
     templates = await db.get_templates()
     await message.answer(
@@ -500,12 +521,6 @@ async def delete_template_num(message: Message, state: FSMContext) -> None:
 # ──────────────────────────────────────────────────────────────
 
 def _parse_interval(text: str) -> tuple[int, int] | None:
-    """
-    Парсит интервал. Форматы:
-      "30"       → (30, 30)  — фиксированный
-      "120-360"  → (120, 360) — диапазон
-    Возвращает None если формат неверный.
-    """
     text = text.strip().replace(" ", "")
     if "-" in text:
         parts = text.split("-", 1)
@@ -520,20 +535,16 @@ def _parse_interval(text: str) -> tuple[int, int] | None:
     return None
 
 
+def _running_accounts() -> list[str]:
+    return [p for p, t in _mailing_tasks.items() if not t.done()]
+
+
 @admin_router.message(F.text == "🚀 Запустить рассылку")
 async def mailing_start(message: Message, state: FSMContext) -> None:
-    global _mailing_task
-    if _mailing_task and not _mailing_task.done():
-        await message.answer(
-            "⚠️ Рассылка уже запущена!\nНажмите <b>🛑 Остановить рассылку</b> чтобы остановить.",
-            parse_mode="HTML", reply_markup=get_stop_keyboard(),
-        )
-        return
-
     accounts = await db.get_all_accounts()
     if not accounts:
         await message.answer(
-            "⚠️ Нет активных аккаунтов.\nДобавьте аккаунт через <b>📱 Добавить аккаунт</b>.",
+            "⚠️ Нет активных аккаунтов.\nДобавьте через <b>📱 Добавить аккаунт</b>.",
             parse_mode="HTML", reply_markup=get_main_keyboard(),
         )
         return
@@ -541,15 +552,106 @@ async def mailing_start(message: Message, state: FSMContext) -> None:
     templates = await db.get_templates()
     if not templates:
         await message.answer(
-            "⚠️ Нет шаблонов сообщений.\nДобавьте шаблоны через <b>📝 Шаблоны</b>.",
+            "⚠️ Нет шаблонов.\nДобавьте через <b>📝 Шаблоны</b>.",
             parse_mode="HTML", reply_markup=get_main_keyboard(),
         )
         return
 
+    running = _running_accounts()
+    lines = ["🚀 <b>Выберите аккаунт для рассылки</b>\n"]
+    for i, acc in enumerate(accounts, 1):
+        phone = acc["phone"]
+        is_running = phone in running
+        marker = " 🔄 (уже работает)" if is_running else ""
+        lines.append(f"<b>{i}.</b> <code>{phone}</code>{marker}")
+    lines.append("\nВведите номер аккаунта:")
+
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=get_back_keyboard())
+    await state.update_data(accounts=[acc["phone"] for acc in accounts])
+    await state.set_state(States.waiting_for_mailing_account)
+
+
+@admin_router.message(States.waiting_for_mailing_account)
+async def mailing_got_account(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip()
+    data = await state.get_data()
+    account_phones: list[str] = data["accounts"]
+
+    if not text.isdigit() or not (1 <= int(text) <= len(account_phones)):
+        await message.answer(
+            f"❌ Введите номер от 1 до {len(account_phones)}:",
+            reply_markup=get_back_keyboard(),
+        )
+        return
+
+    chosen_phone = account_phones[int(text) - 1]
+    running = _running_accounts()
+    if chosen_phone in running:
+        await message.answer(
+            f"⚠️ Аккаунт <code>{chosen_phone}</code> уже ведёт рассылку.\n"
+            "Выберите другой или остановите текущую.",
+            parse_mode="HTML", reply_markup=get_back_keyboard(),
+        )
+        return
+
+    await state.update_data(mailing_phone=chosen_phone)
+
+    # Показываем шаблоны и просим выбрать
+    templates = await db.get_templates()
+    lines = [
+        f"✅ Аккаунт: <code>{chosen_phone}</code>\n",
+        "📝 <b>Выберите шаблоны для этой рассылки:</b>\n",
+    ]
+    for i, t in enumerate(templates, 1):
+        preview = t["text"][:60].replace("\n", " ")
+        if len(t["text"]) > 60:
+            preview += "..."
+        lines.append(f"<b>{i}.</b> {preview}")
+    lines.append(
+        "\nВведите номера шаблонов через запятую: <code>1,3</code>\n"
+        "Или <code>все</code> — использовать все шаблоны"
+    )
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=get_back_keyboard())
+    await state.update_data(all_template_ids=[t["id"] for t in templates],
+                            all_template_texts=[t["text"] for t in templates],
+                            template_count=len(templates))
+    await state.set_state(States.waiting_for_mailing_templates)
+
+
+@admin_router.message(States.waiting_for_mailing_templates)
+async def mailing_got_templates(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip().lower()
+    data = await state.get_data()
+    all_texts: list[str] = data["all_template_texts"]
+    count: int = data["template_count"]
+
+    if text in ("все", "all", "всё"):
+        chosen_texts = all_texts
+    else:
+        parts = [p.strip() for p in text.split(",")]
+        chosen_texts = []
+        for p in parts:
+            if p.isdigit() and 1 <= int(p) <= count:
+                chosen_texts.append(all_texts[int(p) - 1])
+        if not chosen_texts:
+            await message.answer(
+                f"❌ Укажите номера от 1 до {count} через запятую, или <code>все</code>:",
+                parse_mode="HTML", reply_markup=get_back_keyboard(),
+            )
+            return
+        # убираем дубли сохраняя порядок
+        seen: set[str] = set()
+        unique: list[str] = []
+        for t in chosen_texts:
+            if t not in seen:
+                seen.add(t)
+                unique.append(t)
+        chosen_texts = unique
+
+    await state.update_data(mailing_templates=chosen_texts)
     await message.answer(
-        f"📂 <b>Рассылка — Шаг 1/2</b>\n\n"
-        f"📝 Шаблонов: <b>{len(templates)}</b> (будут использоваться по очереди)\n\n"
-        f"Отправьте <b>.txt файл</b> со списком номеров телефонов\n"
+        f"✅ Выбрано шаблонов: <b>{len(chosen_texts)}</b>\n\n"
+        f"📂 Отправьте <b>.txt файл</b> со списком номеров\n"
         f"(один номер на строку, формат: +79001234567)",
         parse_mode="HTML", reply_markup=get_back_keyboard(),
     )
@@ -585,10 +687,9 @@ async def mailing_got_file(message: Message, state: FSMContext) -> None:
     await state.update_data(numbers=numbers)
     await message.answer(
         f"✅ Загружено <b>{len(numbers)}</b> номеров.\n\n"
-        f"⏱ <b>Шаг 2/2:</b> Введите интервал между сообщениями\n\n"
-        f"Форматы:\n"
+        f"⏱ Введите интервал между сообщениями:\n\n"
         f"• <code>30</code> — фиксированные 30 секунд\n"
-        f"• <code>120-360</code> — случайный интервал от 120 до 360 секунд",
+        f"• <code>120-360</code> — случайный интервал от 120 до 360 сек",
         parse_mode="HTML", reply_markup=get_back_keyboard(),
     )
     await state.set_state(States.waiting_for_mailing_interval)
@@ -602,13 +703,10 @@ async def mailing_file_wrong(message: Message) -> None:
 
 @admin_router.message(States.waiting_for_mailing_interval)
 async def mailing_got_interval(message: Message, state: FSMContext) -> None:
-    global _mailing_task
-
     parsed = _parse_interval(message.text or "")
     if parsed is None:
         await message.answer(
-            "❌ Неверный формат.\n\n"
-            "Примеры:\n• <code>30</code>\n• <code>120-360</code>",
+            "❌ Неверный формат.\n\nПримеры:\n• <code>30</code>\n• <code>120-360</code>",
             parse_mode="HTML", reply_markup=get_back_keyboard(),
         )
         return
@@ -616,12 +714,15 @@ async def mailing_got_interval(message: Message, state: FSMContext) -> None:
     min_interval, max_interval = parsed
     data = await state.get_data()
     numbers: list[str] = data["numbers"]
+    phone: str = data["mailing_phone"]
+    templates: list[str] = data["mailing_templates"]
     await state.clear()
 
     accounts = await db.get_all_accounts()
-    templates = await db.get_templates()
-    active_accounts = accounts[:10]
-    n_acc = len(active_accounts)
+    account = next((a for a in accounts if a["phone"] == phone), None)
+    if not account:
+        await message.answer("❌ Аккаунт не найден. Попробуйте снова.", reply_markup=get_main_keyboard())
+        return
 
     if min_interval == max_interval:
         interval_text = f"{min_interval} сек"
@@ -630,41 +731,42 @@ async def mailing_got_interval(message: Message, state: FSMContext) -> None:
 
     status_msg = await message.answer(
         f"🚀 <b>Рассылка запущена!</b>\n\n"
+        f"👤 Аккаунт: <code>{phone}</code>\n"
         f"📋 Номеров: <b>{len(numbers)}</b>\n"
-        f"⏱ Интервал: <b>{interval_text}</b>\n"
-        f"👤 Аккаунтов: <b>{n_acc}</b> (параллельно)\n"
-        f"📝 Шаблонов: <b>{len(templates)}</b> (по очереди)\n\n"
-        f"Прогресс: 0/{len(numbers)}",
-        parse_mode="HTML", reply_markup=get_stop_keyboard(),
+        f"📝 Шаблонов: <b>{len(templates)}</b>\n"
+        f"⏱ Интервал: <b>{interval_text}</b>\n\n"
+        f"Прогресс: 0/{len(numbers)}\n\n"
+        f"<i>Можете вернуться в меню — рассылка продолжится в фоне</i>",
+        parse_mode="HTML",
+        reply_markup=get_mailing_active_keyboard(),
     )
 
-    _mailing_task = asyncio.create_task(
+    task = asyncio.create_task(
         _run_mailing(
             bot=message.bot,
             chat_id=message.chat.id,
             status_msg=status_msg,
             numbers=numbers,
-            templates=[t["text"] for t in templates],
+            templates=templates,
             min_interval=min_interval,
             max_interval=max_interval,
-            accounts=active_accounts,
+            account=account,
         )
     )
+    _mailing_tasks[phone] = task
 
 
 async def _run_mailing(
     bot, chat_id: int, status_msg,
     numbers: list[str], templates: list[str],
     min_interval: int, max_interval: int,
-    accounts: list[dict],
+    account: dict,
 ) -> None:
+    phone = account["phone"]
     total = len(numbers)
-    n_acc = len(accounts)
     n_tpl = len(templates)
 
     counters = {"ok": 0, "no_tg": 0, "privacy": 0, "banned": 0, "error": 0, "done": 0}
-    per_acc = {acc["phone"]: {"ok": 0, "no_tg": 0, "fail": 0} for acc in accounts}
-    lock = asyncio.Lock()
 
     async def update_status() -> None:
         try:
@@ -672,52 +774,37 @@ async def _run_mailing(
                 interval_text = f"{min_interval} сек"
             else:
                 interval_text = f"{min_interval}–{max_interval} сек"
-            lines = [
-                f"⏳ <b>Рассылка в процессе...</b>\n",
-                f"Прогресс: {counters['done']}/{total}",
-                f"✅ Отправлено: {counters['ok']}",
-                f"⭕ Нет Telegram: {counters['no_tg']}",
-                f"🔒 Приватность: {counters['privacy']}",
-                f"❌ Ошибок: {counters['error']}",
+            await status_msg.edit_text(
+                f"⏳ <b>Рассылка: <code>{phone}</code></b>\n\n"
+                f"Прогресс: {counters['done']}/{total}\n"
+                f"✅ Отправлено: {counters['ok']}\n"
+                f"⭕ Нет Telegram: {counters['no_tg']}\n"
+                f"🔒 Приватность: {counters['privacy']}\n"
+                f"❌ Ошибок: {counters['error']}\n"
                 f"⏱ Интервал: {interval_text}",
-            ]
-            if n_acc > 1:
-                lines.append("\n<b>По аккаунтам:</b>")
-                for phone, s in per_acc.items():
-                    lines.append(f"  <code>{phone[-7:]}</code>: ✅{s['ok']} ⭕{s['no_tg']} ❌{s['fail']}")
-            await status_msg.edit_text("\n".join(lines), parse_mode="HTML")
+                parse_mode="HTML",
+            )
         except Exception:
             pass
 
-    async def worker(account: dict, my_numbers: list[str], start_tpl_idx: int) -> None:
-        phone = account["phone"]
-        try:
-            client = await ub_mgr.get_client(phone, account["api_id"], account["api_hash"])
-        except Exception as e:
-            logger.warning("Не удалось получить клиент %s: %s", phone, e)
-            async with lock:
-                counters["error"] += len(my_numbers)
-                counters["done"] += len(my_numbers)
-            return
+    # Перемешанные циклы шаблонов — без повторов подряд
+    def _make_cycle(last_idx: int | None) -> list[int]:
+        idxs = list(range(n_tpl))
+        random.shuffle(idxs)
+        if last_idx is not None and n_tpl > 1 and idxs[0] == last_idx:
+            swap_pos = random.randint(1, n_tpl - 1)
+            idxs[0], idxs[swap_pos] = idxs[swap_pos], idxs[0]
+        return idxs
 
-        # Строим бесконечную очередь шаблонов:
-        # перемешиваем все индексы, проходим цикл, перемешиваем снова —
-        # при этом следим чтобы первый следующего цикла ≠ последнему текущего.
-        def _make_cycle(last_idx: int | None) -> list[int]:
-            idxs = list(range(n_tpl))
-            random.shuffle(idxs)
-            # Если совпал с хвостом предыдущего цикла — свапаем с другим
-            if last_idx is not None and n_tpl > 1 and idxs[0] == last_idx:
-                swap_pos = random.randint(1, n_tpl - 1)
-                idxs[0], idxs[swap_pos] = idxs[swap_pos], idxs[0]
-            return idxs
+    tpl_queue = _make_cycle(None)
+    tpl_pos = 0
 
-        tpl_queue: list[int] = _make_cycle(None)
-        tpl_pos = 0
+    result_text = ""
+    try:
+        client = await ub_mgr.get_client(phone, account["api_id"], account["api_hash"])
 
-        for i, recipient in enumerate(my_numbers):
+        for i, recipient in enumerate(numbers):
             if tpl_pos >= len(tpl_queue):
-                # Цикл закончился — перемешиваем снова
                 tpl_queue = _make_cycle(tpl_queue[-1])
                 tpl_pos = 0
             tpl_idx = tpl_queue[tpl_pos]
@@ -729,67 +816,54 @@ async def _run_mailing(
             except Exception as e:
                 status = f"error: {e}"
 
-            async with lock:
-                counters["done"] += 1
-                if status == "ok":
-                    counters["ok"] += 1
-                    per_acc[phone]["ok"] += 1
-                elif status == "no_telegram":
-                    counters["no_tg"] += 1
-                    per_acc[phone]["no_tg"] += 1
-                elif status == "privacy":
-                    counters["privacy"] += 1
-                    per_acc[phone]["fail"] += 1
-                elif status == "banned":
-                    counters["banned"] += 1
-                    per_acc[phone]["fail"] += 1
-                else:
-                    counters["error"] += 1
-                    per_acc[phone]["fail"] += 1
+            counters["done"] += 1
+            if status == "ok":
+                counters["ok"] += 1
+            elif status == "no_telegram":
+                counters["no_tg"] += 1
+            elif status == "privacy":
+                counters["privacy"] += 1
+            elif status == "banned":
+                counters["banned"] += 1
+            else:
+                counters["error"] += 1
 
-                if counters["done"] % 5 == 0 or counters["done"] == total:
-                    asyncio.create_task(update_status())
+            if counters["done"] % 5 == 0 or counters["done"] == total:
+                asyncio.create_task(update_status())
 
-            # Пауза только если сообщение успешно отправлено
-            # Если номера нет в Telegram — сразу переходим к следующему без ожидания
-            if status == "ok" and i < len(my_numbers) - 1:
+            # Пауза только после успешной отправки
+            if status == "ok" and i < len(numbers) - 1:
                 wait = random.randint(min_interval, max_interval)
                 logger.info("Аккаунт %s: следующее сообщение через %d сек", phone, wait)
                 await asyncio.sleep(wait)
 
-    # Делим номера между аккаунтами и задаём каждому стартовый индекс шаблона
-    worker_coros = []
-    for idx, account in enumerate(accounts):
-        my_slice = numbers[idx::n_acc]
-        if my_slice:
-            # Каждый аккаунт начинает с другого шаблона → равномерное распределение
-            worker_coros.append(worker(account, my_slice, start_tpl_idx=idx % n_tpl))
-
-    result_text = ""
-    try:
-        await asyncio.gather(*worker_coros)
-
         result_text = (
             f"✅ <b>Рассылка завершена!</b>\n\n"
+            f"👤 Аккаунт: <code>{phone}</code>\n"
             f"📋 Всего номеров: {total}\n"
             f"✅ Отправлено: {counters['ok']}\n"
             f"⭕ Нет Telegram: {counters['no_tg']}\n"
             f"🔒 Приватность: {counters['privacy']}\n"
             f"❌ Ошибок: {counters['error']}\n"
-            f"🚫 Забанено аккаунтов: {counters['banned']}\n"
+            f"🚫 Забанено: {counters['banned']}"
         )
-        if n_acc > 1:
-            result_text += "\n<b>По аккаунтам:</b>\n"
-            for phone, s in per_acc.items():
-                result_text += f"  <code>{phone}</code>: ✅{s['ok']} ⭕{s['no_tg']} ❌{s['fail']}\n"
 
     except asyncio.CancelledError:
         result_text = (
             f"🛑 <b>Рассылка остановлена</b>\n\n"
+            f"👤 Аккаунт: <code>{phone}</code>\n"
             f"Обработано: {counters['done']}/{total}\n"
             f"✅ Отправлено: {counters['ok']} | "
-            f"⭕ Нет Telegram: {counters['no_tg']} | "
+            f"⭕ Нет TG: {counters['no_tg']} | "
             f"❌ Ошибок: {counters['error']}"
+        )
+
+    except Exception as e:
+        result_text = (
+            f"❌ <b>Рассылка прервана из-за ошибки</b>\n\n"
+            f"👤 Аккаунт: <code>{phone}</code>\n"
+            f"Обработано: {counters['done']}/{total}\n"
+            f"Ошибка: <code>{e}</code>"
         )
 
     try:
@@ -798,23 +872,81 @@ async def _run_mailing(
         pass
 
     try:
-        await bot.send_message(chat_id, "🏠 Главное меню", reply_markup=get_main_keyboard())
+        await bot.send_message(
+            chat_id,
+            result_text + "\n\n🏠 Главное меню",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
+        )
     except Exception:
         pass
 
 
 # ──────────────────────────────────────────────────────────────
-# СТОП
+# ОСТАНОВИТЬ РАССЫЛКУ
 # ──────────────────────────────────────────────────────────────
 
 @admin_router.message(F.text == STOP_BTN)
-async def mailing_stop(message: Message) -> None:
-    global _mailing_task
-    if _mailing_task and not _mailing_task.done():
-        _mailing_task.cancel()
-        await message.answer("🛑 Останавливаю рассылку...", reply_markup=get_main_keyboard())
-    else:
-        await message.answer("ℹ️ Рассылка не запущена.", reply_markup=get_main_keyboard())
+async def mailing_stop(message: Message, state: FSMContext) -> None:
+    running = _running_accounts()
+
+    if not running:
+        await message.answer("ℹ️ Нет активных рассылок.", reply_markup=get_main_keyboard())
+        return
+
+    if len(running) == 1:
+        phone = running[0]
+        _mailing_tasks[phone].cancel()
+        await message.answer(
+            f"🛑 Останавливаю рассылку аккаунта <code>{phone}</code>...",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    # Несколько рассылок — спрашиваем какую остановить
+    lines = ["🛑 <b>Выберите рассылку для остановки:</b>\n"]
+    for i, p in enumerate(running, 1):
+        lines.append(f"<b>{i}.</b> <code>{p}</code>")
+    lines.append("\nВведите номер (или <code>все</code> — остановить все):")
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=get_back_keyboard())
+    await state.update_data(running_phones=running)
+    await state.set_state(States.waiting_for_stop_account)
+
+
+@admin_router.message(States.waiting_for_stop_account)
+async def stop_account_chosen(message: Message, state: FSMContext) -> None:
+    text = (message.text or "").strip().lower()
+    data = await state.get_data()
+    running: list[str] = data.get("running_phones", [])
+    await state.clear()
+
+    if text in ("все", "all", "всё"):
+        for p in running:
+            if p in _mailing_tasks and not _mailing_tasks[p].done():
+                _mailing_tasks[p].cancel()
+        await message.answer(
+            f"🛑 Останавливаю все рассылки ({len(running)} шт.)...",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    if text.isdigit() and 1 <= int(text) <= len(running):
+        phone = running[int(text) - 1]
+        if phone in _mailing_tasks and not _mailing_tasks[phone].done():
+            _mailing_tasks[phone].cancel()
+        await message.answer(
+            f"🛑 Останавливаю рассылку аккаунта <code>{phone}</code>...",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
+        )
+        return
+
+    await message.answer(
+        f"❌ Введите номер от 1 до {len(running)} или <code>все</code>:",
+        parse_mode="HTML",
+        reply_markup=get_back_keyboard(),
+    )
 
 
 # ──────────────────────────────────────────────────────────────
@@ -825,6 +957,8 @@ async def mailing_stop(message: Message) -> None:
 async def show_stats(message: Message) -> None:
     stats = await db.get_stats()
     accounts = await db.get_all_accounts()
+    running = _running_accounts()
+
     lines = [
         "📊 <b>Статистика</b>\n",
         f"🟢 Активных аккаунтов: <b>{stats['active']}</b>",
@@ -832,16 +966,21 @@ async def show_stats(message: Message) -> None:
         f"📤 Всего отправлено: <b>{stats['total_sent']}</b>",
         f"📅 Отправлено сегодня: <b>{stats['sent_today']}</b>",
     ]
-    global _mailing_task
-    if _mailing_task and not _mailing_task.done():
-        lines.append("\n🔄 <b>Рассылка сейчас активна</b>")
+    if running:
+        lines.append(f"\n🔄 <b>Активных рассылок: {len(running)}</b>")
+        for p in running:
+            lines.append(f"   • <code>{p}</code>")
+
     if accounts:
         lines.append("\n<b>Аккаунты:</b>")
         for acc in accounts:
-            s = "🟢" if acc.get("active", 1) else "🔴"
-            lines.append(f"  {s} <code>{acc['phone']}</code> — отправлено: {acc['sent_count']}")
+            phone = acc["phone"]
+            is_running = phone in running
+            s = "🔄" if is_running else ("🟢" if acc.get("active", 1) else "🔴")
+            lines.append(f"  {s} <code>{phone}</code> — отправлено: {acc['sent_count']}")
     else:
         lines.append("\n<i>Аккаунты не добавлены</i>")
+
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=get_main_keyboard())
 
 
@@ -893,8 +1032,7 @@ async def get_api_hash(message: Message, state: FSMContext) -> None:
     await message.answer(
         f"✅ <b>API настроен!</b>\n\n"
         f"API_ID: <code>{api_id}</code>\n"
-        f"API_HASH: <code>{api_hash}</code>\n\n"
-        f"Теперь добавьте аккаунт через <b>📱 Добавить аккаунт</b>.",
+        f"API_HASH: <code>{api_hash}</code>",
         parse_mode="HTML", reply_markup=get_main_keyboard(),
     )
 
@@ -911,21 +1049,15 @@ async def show_admins(message: Message, state: FSMContext) -> None:
     for uid in admins:
         lines.append(f"  • <code>{uid}</code>")
     lines.append(f"\n<i>Ваш ID: <code>{message.from_user.id}</code></i>")
-    await message.answer(
-        "\n".join(lines),
-        parse_mode="HTML",
-        reply_markup=get_admins_keyboard(),
-    )
+    await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=get_admins_keyboard())
 
 
 @admin_router.message(F.text == "➕ Добавить админа")
 async def add_admin_start(message: Message, state: FSMContext) -> None:
     await message.answer(
         "➕ <b>Добавить администратора</b>\n\n"
-        "Введите Telegram ID пользователя.\n"
-        "Чтобы узнать ID — перешлите сообщение боту @userinfobot",
-        parse_mode="HTML",
-        reply_markup=get_back_keyboard(),
+        "Введите Telegram ID. Узнать ID: @userinfobot",
+        parse_mode="HTML", reply_markup=get_back_keyboard(),
     )
     await state.set_state(States.waiting_for_new_admin_id)
 
@@ -934,22 +1066,19 @@ async def add_admin_start(message: Message, state: FSMContext) -> None:
 async def add_admin_id(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     if not text.lstrip("-").isdigit():
-        await message.answer("❌ ID должен быть числом. Попробуйте ещё раз:", reply_markup=get_back_keyboard())
+        await message.answer("❌ ID должен быть числом:", reply_markup=get_back_keyboard())
         return
-
     user_id = int(text)
     if user_id == message.from_user.id:
-        await message.answer("❌ Нельзя добавить самого себя — вы уже администратор.",
-                             reply_markup=get_admins_keyboard())
+        await message.answer("❌ Нельзя добавить самого себя.", reply_markup=get_admins_keyboard())
         await state.clear()
         return
-
     added = await db.add_admin(user_id)
     if added:
         await message.answer(f"✅ Администратор <code>{user_id}</code> добавлен.",
                              parse_mode="HTML", reply_markup=get_admins_keyboard())
     else:
-        await message.answer(f"ℹ️ Пользователь <code>{user_id}</code> уже является администратором.",
+        await message.answer(f"ℹ️ <code>{user_id}</code> уже администратор.",
                              parse_mode="HTML", reply_markup=get_admins_keyboard())
     await state.clear()
 
@@ -958,14 +1087,13 @@ async def add_admin_id(message: Message, state: FSMContext) -> None:
 async def remove_admin_start(message: Message, state: FSMContext) -> None:
     admins = await db.get_admins()
     if len(admins) <= 1:
-        await message.answer("❌ Нельзя удалить последнего администратора.",
-                             reply_markup=get_admins_keyboard())
+        await message.answer("❌ Нельзя удалить последнего администратора.", reply_markup=get_admins_keyboard())
         return
-    lines = ["➖ <b>Удалить администратора</b>\n", "Текущие администраторы:"]
+    lines = ["➖ <b>Удалить администратора</b>\n"]
     for uid in admins:
         marker = " (вы)" if uid == message.from_user.id else ""
         lines.append(f"  • <code>{uid}</code>{marker}")
-    lines.append("\nВведите ID администратора которого хотите удалить:")
+    lines.append("\nВведите ID для удаления:")
     await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=get_back_keyboard())
     await state.set_state(States.waiting_for_remove_admin_id)
 
@@ -974,23 +1102,18 @@ async def remove_admin_start(message: Message, state: FSMContext) -> None:
 async def remove_admin_id(message: Message, state: FSMContext) -> None:
     text = (message.text or "").strip()
     if not text.lstrip("-").isdigit():
-        await message.answer("❌ ID должен быть числом. Попробуйте ещё раз:", reply_markup=get_back_keyboard())
+        await message.answer("❌ ID должен быть числом:", reply_markup=get_back_keyboard())
         return
-
     user_id = int(text)
     if user_id == message.from_user.id:
-        await message.answer("❌ Нельзя удалить самого себя из администраторов.",
-                             reply_markup=get_admins_keyboard())
+        await message.answer("❌ Нельзя удалить самого себя.", reply_markup=get_admins_keyboard())
         await state.clear()
         return
-
     admins = await db.get_admins()
     if len(admins) <= 1:
-        await message.answer("❌ Нельзя удалить последнего администратора.",
-                             reply_markup=get_admins_keyboard())
+        await message.answer("❌ Нельзя удалить последнего администратора.", reply_markup=get_admins_keyboard())
         await state.clear()
         return
-
     removed = await db.remove_admin(user_id)
     if removed:
         await message.answer(f"✅ Администратор <code>{user_id}</code> удалён.",
