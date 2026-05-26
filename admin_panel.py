@@ -26,7 +26,7 @@ _mailing_tasks: dict[str, asyncio.Task] = {}
 
 
 class IsAdmin(Filter):
-async def __call__(self, message: Message) -> bool:
+    async def __call__(self, message: Message) -> bool:
         if message.from_user is None:
             return False
         try:
