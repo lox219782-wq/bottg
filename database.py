@@ -20,13 +20,11 @@ async def init_db() -> None:
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Миграция: добавляем session_string если таблица уже существует со старой схемой
         try:
             await db.execute("ALTER TABLE accounts ADD COLUMN session_string TEXT NOT NULL DEFAULT ''")
             await db.commit()
         except Exception:
             pass
-        # Миграция: убираем зависимость от session_name (оставляем для совместимости)
         try:
             await db.execute("ALTER TABLE accounts ADD COLUMN session_name TEXT NOT NULL DEFAULT ''")
             await db.commit()
@@ -59,7 +57,59 @@ async def init_db() -> None:
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
+
+
+async def seed_admins(admin_ids: list[int]) -> None:
+    """Добавляет начальных админов из config.py если таблица пустая."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM admins") as cursor:
+            row = await cursor.fetchone()
+            if row and row[0] > 0:
+                return
+        for user_id in admin_ids:
+            await db.execute(
+                "INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,)
+            )
+        await db.commit()
+
+
+async def get_admins() -> list[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM admins ORDER BY added_at") as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+
+async def add_admin(user_id: int) -> bool:
+    """Возвращает True если добавлен, False если уже был."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def remove_admin(user_id: int) -> bool:
+    """Возвращает True если удалён, False если не найден."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def is_admin(user_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,)) as cursor:
+            return await cursor.fetchone() is not None
 
 
 async def save_api_settings(api_id: int, api_hash: str) -> None:
