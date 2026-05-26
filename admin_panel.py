@@ -735,8 +735,9 @@ async def _run_mailing(
                 if counters["done"] % 5 == 0 or counters["done"] == total:
                     asyncio.create_task(update_status())
 
-            # Случайная пауза между сообщениями (кроме последнего)
-            if i < len(my_numbers) - 1:
+            # Пауза только если сообщение успешно отправлено
+            # Если номера нет в Telegram — сразу переходим к следующему без ожидания
+            if status == "ok" and i < len(my_numbers) - 1:
                 wait = random.randint(min_interval, max_interval)
                 logger.info("Аккаунт %s: следующее сообщение через %d сек", phone, wait)
                 await asyncio.sleep(wait)
