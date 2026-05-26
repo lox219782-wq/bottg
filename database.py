@@ -64,6 +64,13 @@ async def init_db() -> None:
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
 
@@ -89,7 +96,6 @@ async def get_admins() -> list[int]:
 
 
 async def add_admin(user_id: int) -> bool:
-    """Возвращает True если добавлен, False если уже был."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             "INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (user_id,)
@@ -99,7 +105,6 @@ async def add_admin(user_id: int) -> bool:
 
 
 async def remove_admin(user_id: int) -> bool:
-    """Возвращает True если удалён, False если не найден."""
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
         await db.commit()
@@ -111,6 +116,52 @@ async def is_admin(user_id: int) -> bool:
         async with db.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,)) as cursor:
             return await cursor.fetchone() is not None
 
+
+# ──────────────────────────────────────────────────────────────
+# ШАБЛОНЫ
+# ──────────────────────────────────────────────────────────────
+
+async def get_templates() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM templates ORDER BY id") as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def add_template(text: str) -> int:
+    """Добавляет шаблон. Возвращает его id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("INSERT INTO templates (text) VALUES (?)", (text,))
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def update_template(template_id: int, text: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE templates SET text=? WHERE id=?", (text, template_id)
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def delete_template(template_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute("DELETE FROM templates WHERE id=?", (template_id,))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def clear_templates() -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM templates")
+        await db.commit()
+
+
+# ──────────────────────────────────────────────────────────────
+# ОСТАЛЬНЫЕ ФУНКЦИИ
+# ──────────────────────────────────────────────────────────────
 
 async def save_api_settings(api_id: int, api_hash: str) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -142,7 +193,6 @@ async def get_api_settings() -> tuple[int, str]:
 
 
 async def add_account(phone: str, session_string: str, api_id: int, api_hash: str) -> None:
-    """Сохраняет аккаунт с session_string (строка Pyrogram StringSession)."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
             INSERT OR REPLACE INTO accounts (phone, session_string, api_id, api_hash, active, sent_count)
@@ -178,7 +228,6 @@ async def log_mailing(phone: str, recipient: str, status: str) -> None:
 
 
 async def save_contacts(contacts: list[dict]) -> int:
-    """Сохраняет найденные контакты (у которых есть Telegram). Возвращает кол-во новых."""
     new_count = 0
     async with aiosqlite.connect(DB_PATH) as db:
         for c in contacts:
