@@ -13,12 +13,14 @@ except ImportError:
     from admin_router import admin_router
 from config import BOT_TOKEN, ADMIN_IDS
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger(__name__)
+    logger.info("Инициализация базы данных...")
+    try:
+        await db.init_db()
+        await db.seed_admins(ADMIN_IDS)  # ← добавьте эту строку
+        logger.info("База данных готова.")
+    except Exception as e:
+        logger.error("Ошибка инициализации БД: %s", e)
+        sys.exit(1)
 
 
 async def notify_admins(bot: Bot) -> None:
