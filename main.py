@@ -13,12 +13,29 @@ except ImportError:
     from admin_router import admin_router
 from config import BOT_TOKEN, ADMIN_IDS
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+
+# Pyrogram иногда получает обновления о каналах которых нет в кэше сессии.
+# Это безвредный шум — подавляем через системный обработчик исключений asyncio.
+_SUPPRESSED_MSGS = (
+    "Peer id invalid",
+    "ID not found",
+)
+
+def _asyncio_exception_handler(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    exc = context.get("exception")
+    if exc is not None:
+        msg = str(exc)
+        if any(s in msg for s in _SUPPRESSED_MSGS):
+            return
+    # Всё остальное — стандартный обработчик
+    loop.default_exception_handler(context)
 
 
 async def notify_admins(bot: Bot) -> None:
@@ -35,6 +52,10 @@ async def on_shutdown(bot: Bot) -> None:
 
 
 async def main() -> None:
+    # Устанавливаем обработчик до старта любых клиентов
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(_asyncio_exception_handler)
+
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN не задан! Установите переменную окружения BOT_TOKEN.")
         sys.exit(1)
