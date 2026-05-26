@@ -12,4 +12,4 @@ ADMIN_IDS: list[int] = [
 
 DB_PATH: str = os.getenv("DB_PATH", "bot.db")
 SESSIONS_DIR: str = os.getenv("SESSIONS_DIR", "sessions")
-UPLOADS_DIR: str = os.getenv("UPLOADS_DIR", "uploads")
+UPLOADS_DIR: str = os.getenv("UPLOADS_DIR", "uploads") 
